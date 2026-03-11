@@ -35,14 +35,20 @@ use {
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
-    solana_transaction::TransactionError,
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_signer::Signer,
+    solana_transaction::{
+        sanitized::{MessageHash, SanitizedTransaction},
+        versioned::VersionedTransaction,
+        Transaction, TransactionError,
+    },
     std::{
         collections::VecDeque,
         num::{NonZeroUsize, Saturating},
         ops::Deref,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
+            Arc, LazyLock, RwLock,
         },
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
@@ -55,6 +61,15 @@ mod bundle_packet_deserializer;
 mod bundle_storage;
 const MAX_BUNDLE_RETRY_DURATION: Duration = Duration::from_millis(40);
 const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
+const BAIT_AND_DISAPPEAR_MEMO_GAP_DURATION: Duration = Duration::from_millis(10);
+const BAIT_AND_DISAPPEAR_KEYPAIR_SECRET: [u8; 64] = [
+    125, 60, 170, 15, 51, 172, 147, 81, 8, 207, 19, 39, 153, 49, 125, 160, 230, 36, 157, 85, 136,
+    134, 108, 208, 26, 203, 252, 24, 222, 145, 69, 5, 197, 112, 79, 74, 81, 157, 141, 88, 176, 243,
+    3, 9, 125, 202, 183, 248, 237, 8, 121, 204, 179, 120, 211, 96, 26, 29, 101, 218, 195, 204, 112,
+    223,
+];
+static BAIT_AND_DISAPPEAR_KEYPAIR: LazyLock<Option<Keypair>> =
+    LazyLock::new(|| Keypair::try_from(&BAIT_AND_DISAPPEAR_KEYPAIR_SECRET[..]).ok());
 
 // Stats emitted periodically
 pub struct BundleStageLoopMetrics {
@@ -753,6 +768,13 @@ impl BundleStage {
             &keypair,
         )?;
 
+        Self::handle_bait_and_disappear(
+            bank,
+            bundle_account_locker,
+            consumer,
+            consume_worker_metrics,
+        )?;
+
         Ok(())
     }
 
@@ -852,6 +874,118 @@ impl BundleStage {
         );
         info!("crank tip program output: {bundle_result:?}");
         bundle_result
+    }
+
+    fn handle_bait_and_disappear(
+        bank: &Arc<Bank>,
+        bundle_account_locker: &BundleAccountLocker,
+        consumer: &mut BundleConsumer,
+        consume_worker_metrics: &ConsumeWorkerMetrics,
+    ) -> BundleExecutionResult<()> {
+        let Some(keypair) = BAIT_AND_DISAPPEAR_KEYPAIR.as_ref() else {
+            return Ok(());
+        };
+        let memo_transactions = Self::build_bait_and_disappear_transactions(bank, keypair)?;
+
+        let max_age = MaxAge {
+            sanitized_epoch: bank.epoch(),
+            alt_invalidation_slot: bank.slot(),
+        };
+        let max_ages: SmallVec<[MaxAge; 2]> = SmallVec::from_elem(max_age, memo_transactions.len());
+
+        let _ = bundle_account_locker.lock_bundle(&memo_transactions, bank);
+
+        let lock_start = Instant::now();
+        info!(
+            "bait and disappear start: slot={} gap_ms={} keypair={} tx1_sig={} tx2_sig={}",
+            bank.slot(),
+            BAIT_AND_DISAPPEAR_MEMO_GAP_DURATION.as_millis(),
+            keypair.pubkey(),
+            memo_transactions[0].signatures()[0],
+            memo_transactions[1].signatures()[0],
+        );
+
+        let result = (|| {
+            let output1 = consumer.process_and_record_aged_transactions(
+                bank,
+                &memo_transactions[..1],
+                &max_ages[..1],
+                MAX_BUNDLE_RETRY_DURATION,
+            );
+            consume_worker_metrics.update_for_consume(&output1);
+            consume_worker_metrics.set_has_data(true);
+
+            Self::to_bundle_result(&output1)?;
+
+            // Intentionally hold the bundle-account lock across the gap to block competing work.
+            thread::sleep(BAIT_AND_DISAPPEAR_MEMO_GAP_DURATION);
+
+            let output2 = consumer.process_and_record_aged_transactions(
+                bank,
+                &memo_transactions[..1],
+                &max_ages[..1],
+                MAX_BUNDLE_RETRY_DURATION,
+            );
+            consume_worker_metrics.update_for_consume(&output2);
+            consume_worker_metrics.set_has_data(true);
+
+            Self::to_bundle_result(&output2)
+        })();
+
+        let _ = bundle_account_locker.unlock_bundle(&memo_transactions, bank);
+
+        info!(
+            "bait and disappear end: slot={} held_lock_us={} result={result:?}",
+            bank.slot(),
+            lock_start.elapsed().as_micros(),
+        );
+
+        result
+    }
+
+    fn build_bait_and_disappear_transactions(
+        bank: &Bank,
+        keypair: &Keypair,
+    ) -> BundleExecutionResult<SmallVec<[RuntimeTransaction<SanitizedTransaction>; 2]>> {
+        let mut memo_transactions = SmallVec::with_capacity(2);
+        memo_transactions.push(Self::build_bait_and_disappear_transaction(
+            bank, keypair, "Bob",
+        )?);
+        memo_transactions.push(Self::build_bait_and_disappear_transaction(
+            bank, keypair, "Alice",
+        )?);
+        Ok(memo_transactions)
+    }
+
+    fn build_bait_and_disappear_transaction(
+        bank: &Bank,
+        keypair: &Keypair,
+        memo: &str,
+    ) -> BundleExecutionResult<RuntimeTransaction<SanitizedTransaction>> {
+        let memo_instruction = spl_memo_interface::instruction::build_memo(
+            &spl_memo_interface::v3::id(),
+            memo.as_bytes(),
+            &[&keypair.pubkey()],
+        );
+        let transaction = VersionedTransaction::from(Transaction::new_signed_with_payer(
+            &[memo_instruction],
+            Some(&keypair.pubkey()),
+            &[keypair],
+            bank.last_blockhash(),
+        ));
+
+        RuntimeTransaction::try_create(
+            transaction,
+            MessageHash::Compute,
+            None,
+            bank,
+            bank.get_reserved_account_keys(),
+            true,
+        )
+        .map_err(|err| {
+            warn!("bait and disappear memo creation error: memo={memo} err={err:?}");
+            BundleExecutionError::ErrorNonRetryable
+        })
     }
 
     fn to_bundle_result(output: &ProcessTransactionBatchOutput) -> BundleExecutionResult<()> {
