@@ -1,13 +1,7 @@
-use {
-    solana_address::Address,
-    solana_clock::Slot,
-    solana_instruction::Instruction,
-};
+use {solana_address::Address, solana_clock::Slot, solana_instruction::Instruction};
 
-pub const SLOT_ASSERT_PROGRAM_ID: Address = Address::new_from_array([
-    70, 206, 213, 194, 44, 193, 100, 16, 154, 231, 110, 41, 87, 144, 193, 251, 184, 85, 19,
-    236, 190, 144, 25, 8, 183, 122, 208, 86, 91, 181, 243, 80,
-]);
+pub const SLOT_ASSERT_PROGRAM_ID: Address =
+    Address::from_str_const("S1otXSd4rsN4fReyRwj9CUCTqBGqnPPZREKe6SMMDvW");
 
 const ASSERT_SLOT_DISCRIMINATOR: u8 = 0;
 
