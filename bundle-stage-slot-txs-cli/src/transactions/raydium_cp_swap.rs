@@ -67,12 +67,11 @@ pub fn build_transactions(
         args.input_amount,
         0,
     )?;
-    let simulated_output_amount =
-        simulate_first_leg_output_amount(
-            rpc_client,
-            &simulated_first_leg_transaction,
-            route.user_output_token_account,
-        )?;
+    let first_leg_simulation = simulate_first_leg(
+        rpc_client,
+        &simulated_first_leg_transaction,
+        &route.first_leg,
+    )?;
     let first_leg_max_input_amount = inflate_amount_by_five_percent(args.input_amount)?;
 
     info!(
@@ -81,9 +80,12 @@ pub fn build_transactions(
         first_input_mint = %route.first_leg.input_mint,
         first_output_mint = %route.first_leg.output_mint,
         input_amount = args.input_amount,
-        simulated_output_amount,
+        simulated_output_amount = first_leg_simulation.user_output_amount,
+        pool_input_amount = first_leg_simulation.pool_input_amount,
+        pool_output_amount = first_leg_simulation.pool_output_amount,
+        price_impact_bps = first_leg_simulation.price_impact_bps,
         first_leg_max_input_amount,
-        "loaded raydium cp-swap pool info for round-trip bundle",
+        "simulated first raydium base-input trade impact",
     );
 
     Ok(vec![
@@ -93,14 +95,14 @@ pub fn build_transactions(
             &pool_info,
             &route.first_leg,
             first_leg_max_input_amount,
-            simulated_output_amount,
+            first_leg_simulation.user_output_amount,
         )?,
         build_swap_base_input_transaction(
             signer,
             blockhash,
             &pool_info,
             &route.second_leg,
-            simulated_output_amount,
+            first_leg_simulation.user_output_amount,
             0,
         )?,
     ])
@@ -448,14 +450,26 @@ fn build_transaction(
     ))
 }
 
-fn simulate_first_leg_output_amount(
+#[derive(Clone, Copy, Debug)]
+struct FirstLegSimulation {
+    user_output_amount: u64,
+    pool_input_amount: u64,
+    pool_output_amount: u64,
+    price_impact_bps: u64,
+}
+
+fn simulate_first_leg(
     rpc_client: &RpcClient,
     first_leg_transaction: &VersionedTransaction,
-    output_token_account: Address,
-) -> Result<u64, Box<dyn Error>> {
+    first_leg: &SwapLeg,
+) -> Result<FirstLegSimulation, Box<dyn Error>> {
     let account_config = RpcSimulateTransactionAccountsConfig {
         encoding: Some(UiAccountEncoding::Base64),
-        addresses: vec![output_token_account.to_string()],
+        addresses: vec![
+            first_leg.output_token_account.to_string(),
+            first_leg.input_vault.to_string(),
+            first_leg.output_vault.to_string(),
+        ],
     };
     let simulation_result = rpc_client
         .simulate_bundle_with_config(
@@ -489,25 +503,73 @@ fn simulate_first_leg_output_amount(
         .into_iter()
         .next()
         .ok_or_else(|| io::Error::other("missing simulation result for first raydium leg"))?;
-    let pre_amount = parse_token_amount(
+    let user_output_before = parse_token_amount(
         transaction_result
             .pre_execution_accounts
             .as_ref()
             .and_then(|accounts| accounts.first()),
     )?;
-    let post_amount = parse_token_amount(
+    let user_output_after = parse_token_amount(
         transaction_result
             .post_execution_accounts
             .as_ref()
             .and_then(|accounts| accounts.first()),
     )?;
+    let input_vault_before = parse_token_amount(
+        transaction_result
+            .pre_execution_accounts
+            .as_ref()
+            .and_then(|accounts| accounts.get(1)),
+    )?;
+    let input_vault_after = parse_token_amount(
+        transaction_result
+            .post_execution_accounts
+            .as_ref()
+            .and_then(|accounts| accounts.get(1)),
+    )?;
+    let output_vault_before = parse_token_amount(
+        transaction_result
+            .pre_execution_accounts
+            .as_ref()
+            .and_then(|accounts| accounts.get(2)),
+    )?;
+    let output_vault_after = parse_token_amount(
+        transaction_result
+            .post_execution_accounts
+            .as_ref()
+            .and_then(|accounts| accounts.get(2)),
+    )?;
 
-    post_amount.checked_sub(pre_amount).ok_or_else(|| {
+    let user_output_amount = user_output_after.checked_sub(user_output_before).ok_or_else(|| {
         io::Error::other(format!(
             "simulated first raydium leg decreased output token account unexpectedly: pre={} post={}",
-            pre_amount, post_amount
+            user_output_before, user_output_after
         ))
-        .into()
+    })?;
+    let pool_input_amount = input_vault_after.checked_sub(input_vault_before).ok_or_else(|| {
+        io::Error::other(format!(
+            "simulated first raydium leg decreased input vault unexpectedly: pre={} post={}",
+            input_vault_before, input_vault_after
+        ))
+    })?;
+    let pool_output_amount = output_vault_before.checked_sub(output_vault_after).ok_or_else(|| {
+        io::Error::other(format!(
+            "simulated first raydium leg increased output vault unexpectedly: pre={} post={}",
+            output_vault_before, output_vault_after
+        ))
+    })?;
+    let price_impact_bps = compute_price_impact_bps(
+        input_vault_before,
+        output_vault_before,
+        pool_input_amount,
+        pool_output_amount,
+    )?;
+
+    Ok(FirstLegSimulation {
+        user_output_amount,
+        pool_input_amount,
+        pool_output_amount,
+        price_impact_bps,
     })
 }
 
@@ -548,6 +610,26 @@ fn inflate_amount_by_five_percent(amount: u64) -> Result<u64, Box<dyn Error>> {
         .map(|value| value / 100)
         .filter(|value| *value > 0)
         .ok_or_else(|| io::Error::other("failed to compute 5% slippage-adjusted amount").into())
+}
+
+fn compute_price_impact_bps(
+    input_vault_before: u64,
+    output_vault_before: u64,
+    pool_input_amount: u64,
+    pool_output_amount: u64,
+) -> Result<u64, Box<dyn Error>> {
+    if input_vault_before == 0 || output_vault_before == 0 {
+        return Err(io::Error::other("raydium pool reserves must be non-zero").into());
+    }
+
+    let expected_output_amount = (u128::from(pool_input_amount) * u128::from(output_vault_before))
+        / u128::from(input_vault_before);
+    if expected_output_amount == 0 {
+        return Ok(0);
+    }
+
+    let shortfall = expected_output_amount.saturating_sub(u128::from(pool_output_amount));
+    Ok(((shortfall * 10_000) / expected_output_amount) as u64)
 }
 
 pub fn simulation_account_configs(

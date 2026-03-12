@@ -18,7 +18,7 @@ use {
 };
 
 pub const BAIT_AND_DISAPPEAR_TXS_PATH: &str = "/tmp/bundle_stage_slot_txs.bin";
-const BAIT_AND_DISAPPEAR_TXS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BAIT_AND_DISAPPEAR_TXS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BaitAndDisappearFile {
