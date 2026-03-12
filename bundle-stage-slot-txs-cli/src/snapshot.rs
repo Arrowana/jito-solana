@@ -32,14 +32,13 @@ pub fn clear_snapshot_file(gap_duration_millis: u64) -> Result<(), Box<dyn Error
     })
 }
 
-pub fn write_target_slot_snapshot(
+pub fn write_target_slots_snapshot(
     gap_duration_millis: u64,
-    slot: Slot,
-    transactions: Vec<VersionedTransaction>,
+    slot_transactions: Vec<BaitAndDisappearSlotTransactions>,
 ) -> Result<(), Box<dyn Error>> {
     write_snapshot_file(&BaitAndDisappearFile {
         gap_duration_millis,
-        slot_transactions: vec![BaitAndDisappearSlotTransactions { slot, transactions }],
+        slot_transactions,
     })
 }
 

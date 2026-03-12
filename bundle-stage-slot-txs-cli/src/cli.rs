@@ -18,6 +18,9 @@ pub struct Config {
     #[arg(long, default_value_t = 10)]
     pub gap_duration_millis: u64,
 
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub consecutive_slots: u8,
+
     #[command(subcommand)]
     pub transaction_mode: Option<TransactionMode>,
 }
