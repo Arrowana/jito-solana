@@ -149,6 +149,7 @@ exclude = [
     # workspace resolution logic, which expects it in the top-level worspace rather than
     # dev-bins
     "bench-tps",
+    "bundle-stage-slot-txs-cli",
     "ci/xtask",
     "dev-bins",
     "programs/sbf",

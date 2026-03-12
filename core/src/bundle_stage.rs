@@ -15,6 +15,10 @@ use {
             bundle_account_locker::BundleAccountLocker,
             bundle_consumer::BundleConsumer,
             bundle_storage::{BundleStorage, BundleStorageEntry, BundleStorageError},
+            external_slot_txs::{
+                new_shared_bait_and_disappear_snapshot,
+                spawn_bait_and_disappear_snapshot_reader, SharedBaitAndDisappearSnapshot,
+            },
         },
         packet_bundle::VerifiedPacketBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
@@ -36,11 +40,10 @@ use {
         vote_sender_types::ReplayVoteSender,
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
-    solana_signer::Signer,
     solana_transaction::{
         sanitized::{MessageHash, SanitizedTransaction},
         versioned::VersionedTransaction,
-        Transaction, TransactionError,
+        TransactionError,
     },
     std::{
         collections::VecDeque,
@@ -48,7 +51,7 @@ use {
         ops::Deref,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, LazyLock, RwLock,
+            Arc, RwLock,
         },
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
@@ -59,17 +62,9 @@ pub mod bundle_account_locker;
 mod bundle_consumer;
 mod bundle_packet_deserializer;
 mod bundle_storage;
+mod external_slot_txs;
 const MAX_BUNDLE_RETRY_DURATION: Duration = Duration::from_millis(40);
 const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
-const BAIT_AND_DISAPPEAR_MEMO_GAP_DURATION: Duration = Duration::from_millis(10);
-const BAIT_AND_DISAPPEAR_KEYPAIR_SECRET: [u8; 64] = [
-    125, 60, 170, 15, 51, 172, 147, 81, 8, 207, 19, 39, 153, 49, 125, 160, 230, 36, 157, 85, 136,
-    134, 108, 208, 26, 203, 252, 24, 222, 145, 69, 5, 197, 112, 79, 74, 81, 157, 141, 88, 176, 243,
-    3, 9, 125, 202, 183, 248, 237, 8, 121, 204, 179, 120, 211, 96, 26, 29, 101, 218, 195, 204, 112,
-    223,
-];
-static BAIT_AND_DISAPPEAR_KEYPAIR: LazyLock<Option<Keypair>> =
-    LazyLock::new(|| Keypair::try_from(&BAIT_AND_DISAPPEAR_KEYPAIR_SECRET[..]).ok());
 
 // Stats emitted periodically
 pub struct BundleStageLoopMetrics {
@@ -342,6 +337,7 @@ enum BundleExecutionError {
 
 pub struct BundleStage {
     bundle_thread: JoinHandle<()>,
+    bait_and_disappear_snapshot_thread: JoinHandle<()>,
 }
 
 impl BundleStage {
@@ -365,6 +361,12 @@ impl BundleStage {
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         blacklisted_accounts: HashSet<Pubkey>,
     ) -> Self {
+        let bait_and_disappear_snapshot = new_shared_bait_and_disappear_snapshot();
+        let bait_and_disappear_snapshot_thread = spawn_bait_and_disappear_snapshot_reader(
+            exit.clone(),
+            bait_and_disappear_snapshot.clone(),
+        );
+
         Self::start_bundle_thread(
             cluster_info,
             bank_forks,
@@ -380,11 +382,14 @@ impl BundleStage {
             block_builder_fee_info,
             prioritization_fee_cache,
             blacklisted_accounts,
+            bait_and_disappear_snapshot,
+            bait_and_disappear_snapshot_thread,
         )
     }
 
     pub fn join(self) -> thread::Result<()> {
-        self.bundle_thread.join()
+        self.bundle_thread.join()?;
+        self.bait_and_disappear_snapshot_thread.join()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -403,6 +408,8 @@ impl BundleStage {
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         blacklisted_accounts: HashSet<Pubkey>,
+        bait_and_disappear_snapshot: SharedBaitAndDisappearSnapshot,
+        bait_and_disappear_snapshot_thread: JoinHandle<()>,
     ) -> Self {
         let committer = Committer::new(
             transaction_status_sender,
@@ -434,11 +441,15 @@ impl BundleStage {
                     tip_manager,
                     block_builder_fee_info,
                     cluster_info,
+                    bait_and_disappear_snapshot,
                 );
             })
             .unwrap();
 
-        Self { bundle_thread }
+        Self {
+            bundle_thread,
+            bait_and_disappear_snapshot_thread,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -453,6 +464,7 @@ impl BundleStage {
         tip_manager: TipManager,
         block_builder_fee_info: Arc<ArcSwap<BlockBuilderFeeInfo>>,
         cluster_info: Arc<ClusterInfo>,
+        bait_and_disappear_snapshot: SharedBaitAndDisappearSnapshot,
     ) {
         let mut last_metrics_update = Instant::now();
         let mut bundle_storage = BundleStorage::with_capacity(2_000);
@@ -477,6 +489,7 @@ impl BundleStage {
                         &block_builder_fee_info,
                         &tip_manager,
                         &cluster_info,
+                        &bait_and_disappear_snapshot,
                         &consume_worker_metrics
                     ));
                 bundle_stage_metrics.increment_process_buffered_bundles_elapsed_us(
@@ -591,6 +604,7 @@ impl BundleStage {
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         tip_manager: &TipManager,
         cluster_info: &Arc<ClusterInfo>,
+        bait_and_disappear_snapshot: &SharedBaitAndDisappearSnapshot,
         consume_worker_metrics: &ConsumeWorkerMetrics,
     ) {
         match decision_maker.make_consume_or_forward_decision() {
@@ -607,6 +621,7 @@ impl BundleStage {
                     block_builder_fee_info,
                     tip_manager,
                     cluster_info,
+                    bait_and_disappear_snapshot,
                     consume_worker_metrics,
                 );
             }
@@ -633,6 +648,7 @@ impl BundleStage {
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         tip_manager: &TipManager,
         cluster_info: &Arc<ClusterInfo>,
+        bait_and_disappear_snapshot: &SharedBaitAndDisappearSnapshot,
         consume_worker_metrics: &ConsumeWorkerMetrics,
     ) {
         const BUNDLE_WINDOW_SIZE: NonZeroUsize = NonZeroUsize::new(10).unwrap();
@@ -647,6 +663,7 @@ impl BundleStage {
                 tip_manager,
                 cluster_info,
                 block_builder_fee_info,
+                bait_and_disappear_snapshot,
                 consume_worker_metrics,
             )
             .is_err()
@@ -745,6 +762,7 @@ impl BundleStage {
         tip_manager: &TipManager,
         cluster_info: &Arc<ClusterInfo>,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
+        bait_and_disappear_snapshot: &SharedBaitAndDisappearSnapshot,
         consume_worker_metrics: &ConsumeWorkerMetrics,
     ) -> BundleExecutionResult<()> {
         let keypair = cluster_info.keypair();
@@ -772,6 +790,7 @@ impl BundleStage {
             bank,
             bundle_account_locker,
             consumer,
+            bait_and_disappear_snapshot,
             consume_worker_metrics,
         )?;
 
@@ -880,12 +899,24 @@ impl BundleStage {
         bank: &Arc<Bank>,
         bundle_account_locker: &BundleAccountLocker,
         consumer: &mut BundleConsumer,
+        bait_and_disappear_snapshot: &SharedBaitAndDisappearSnapshot,
         consume_worker_metrics: &ConsumeWorkerMetrics,
     ) -> BundleExecutionResult<()> {
-        let Some(keypair) = BAIT_AND_DISAPPEAR_KEYPAIR.as_ref() else {
+        let bait_and_disappear_snapshot = bait_and_disappear_snapshot.load();
+        let Some(bait_and_disappear_snapshot) = bait_and_disappear_snapshot.as_ref() else {
             return Ok(());
         };
-        let memo_transactions = Self::build_bait_and_disappear_transactions(bank, keypair)?;
+        let Some(versioned_transactions) =
+            bait_and_disappear_snapshot.transactions_for_slot(bank.slot())
+        else {
+            return Ok(());
+        };
+
+        let Some(memo_transactions) =
+            Self::sanitize_bait_and_disappear_transactions(bank, versioned_transactions)
+        else {
+            return Ok(());
+        };
 
         let max_age = MaxAge {
             sanitized_epoch: bank.epoch(),
@@ -897,10 +928,9 @@ impl BundleStage {
 
         let lock_start = Instant::now();
         info!(
-            "bait and disappear start: slot={} gap_ms={} keypair={} tx1_sig={} tx2_sig={}",
+            "bait and disappear start: slot={} gap_ms={} tx1_sig={} tx2_sig={}",
             bank.slot(),
-            BAIT_AND_DISAPPEAR_MEMO_GAP_DURATION.as_millis(),
-            keypair.pubkey(),
+            bait_and_disappear_snapshot.gap_duration().as_millis(),
             memo_transactions[0].signatures()[0],
             memo_transactions[1].signatures()[0],
         );
@@ -918,7 +948,7 @@ impl BundleStage {
             Self::to_bundle_result(&output1)?;
 
             // Intentionally hold the bundle-account lock across the gap to block competing work.
-            thread::sleep(BAIT_AND_DISAPPEAR_MEMO_GAP_DURATION);
+            thread::sleep(bait_and_disappear_snapshot.gap_duration());
 
             let output2 = consumer.process_and_record_aged_transactions(
                 bank,
@@ -943,49 +973,41 @@ impl BundleStage {
         result
     }
 
-    fn build_bait_and_disappear_transactions(
+    fn sanitize_bait_and_disappear_transactions(
         bank: &Bank,
-        keypair: &Keypair,
-    ) -> BundleExecutionResult<SmallVec<[RuntimeTransaction<SanitizedTransaction>; 2]>> {
+        transactions: &[VersionedTransaction],
+    ) -> Option<SmallVec<[RuntimeTransaction<SanitizedTransaction>; 2]>> {
+        if transactions.len() != 2 {
+            warn!(
+                "bait and disappear slot entry has wrong transaction count: slot={} count={}",
+                bank.slot(),
+                transactions.len(),
+            );
+            return None;
+        }
+
         let mut memo_transactions = SmallVec::with_capacity(2);
-        memo_transactions.push(Self::build_bait_and_disappear_transaction(
-            bank, keypair, "Bob",
-        )?);
-        memo_transactions.push(Self::build_bait_and_disappear_transaction(
-            bank, keypair, "Alice",
-        )?);
-        Ok(memo_transactions)
-    }
+        for (index, transaction) in transactions.iter().enumerate() {
+            let runtime_transaction = RuntimeTransaction::try_create(
+                transaction.clone(),
+                MessageHash::Compute,
+                None,
+                bank,
+                bank.get_reserved_account_keys(),
+                true,
+            )
+            .map_err(|err| {
+                warn!(
+                    "bait and disappear transaction sanitize error: slot={} index={} err={err:?}",
+                    bank.slot(),
+                    index,
+                );
+            })
+            .ok()?;
+            memo_transactions.push(runtime_transaction);
+        }
 
-    fn build_bait_and_disappear_transaction(
-        bank: &Bank,
-        keypair: &Keypair,
-        memo: &str,
-    ) -> BundleExecutionResult<RuntimeTransaction<SanitizedTransaction>> {
-        let memo_instruction = spl_memo_interface::instruction::build_memo(
-            &spl_memo_interface::v3::id(),
-            memo.as_bytes(),
-            &[&keypair.pubkey()],
-        );
-        let transaction = VersionedTransaction::from(Transaction::new_signed_with_payer(
-            &[memo_instruction],
-            Some(&keypair.pubkey()),
-            &[keypair],
-            bank.last_blockhash(),
-        ));
-
-        RuntimeTransaction::try_create(
-            transaction,
-            MessageHash::Compute,
-            None,
-            bank,
-            bank.get_reserved_account_keys(),
-            true,
-        )
-        .map_err(|err| {
-            warn!("bait and disappear memo creation error: memo={memo} err={err:?}");
-            BundleExecutionError::ErrorNonRetryable
-        })
+        Some(memo_transactions)
     }
 
     fn to_bundle_result(output: &ProcessTransactionBatchOutput) -> BundleExecutionResult<()> {
