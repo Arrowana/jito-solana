@@ -149,6 +149,7 @@ exclude = [
     "dev-bins",
     "platform-tools-sdk",
     "programs/sbf",
+    "slot-assert-pinocchio-program",
     "svm/tests/example-programs",
 ]
 

@@ -4,6 +4,7 @@ mod logging;
 mod schedule;
 mod simulation;
 mod snapshot;
+mod slot_assert;
 mod transactions;
 
 use {
@@ -289,6 +290,7 @@ async fn prepare_target_slot(
         signer.as_ref(),
         blockhash,
         target_slot,
+        false,
     )
     .map_err(|err| {
         io::Error::other(format!(
@@ -327,9 +329,23 @@ async fn prepare_target_slot(
         ))
     })?;
 
+    let published_transactions = build_transactions(
+        &prepared_transactions,
+        signer.as_ref(),
+        blockhash,
+        target_slot,
+        true,
+    )
+    .map_err(|err| {
+        io::Error::other(format!(
+            "failed to build published transactions for slot {}: {err}",
+            target_slot,
+        ))
+    })?;
+
     Ok(BaitAndDisappearSlotTransactions {
         slot: target_slot,
-        transactions,
+        transactions: published_transactions,
     })
 }
 

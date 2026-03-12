@@ -1,6 +1,7 @@
 use {
     crate::{
         error::BoxError,
+        slot_assert::build_assert_slot_instruction,
         transactions::ResolvedRaydiumCpSwapArgs,
     },
     bytemuck::{Pod, Zeroable},
@@ -80,6 +81,8 @@ pub(super) async fn prepare_transactions(
         args.input_amount,
         0,
         &first_leg_uniquifier,
+        target_slot,
+        false,
     )?;
     let first_leg_simulation =
         simulate_first_leg(rpc_client, &simulated_first_leg_transaction, &route.first_leg).await?;
@@ -112,6 +115,7 @@ pub(super) fn build_transactions(
     signer: &Keypair,
     blockhash: Hash,
     target_slot: Slot,
+    include_slot_assert: bool,
 ) -> Result<Vec<VersionedTransaction>, BoxError> {
     let first_leg_uniquifier = slot_uniquifier_memo(target_slot, 1);
     let second_leg_uniquifier = slot_uniquifier_memo(target_slot, 2);
@@ -125,6 +129,8 @@ pub(super) fn build_transactions(
             prepared.first_leg_max_input_amount,
             prepared.first_leg_simulation.user_output_amount,
             &first_leg_uniquifier,
+            target_slot,
+            include_slot_assert,
         )?,
         build_swap_base_input_transaction(
             signer,
@@ -134,6 +140,8 @@ pub(super) fn build_transactions(
             prepared.first_leg_simulation.user_output_amount,
             0,
             &second_leg_uniquifier,
+            target_slot,
+            include_slot_assert,
         )?,
     ])
 }
@@ -408,20 +416,25 @@ fn build_swap_base_output_transaction(
     max_input_amount: u64,
     exact_output_amount: u64,
     uniquifier_memo: &str,
+    target_slot: Slot,
+    include_slot_assert: bool,
 ) -> Result<VersionedTransaction, BoxError> {
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SWAP_BASE_OUTPUT_DISCRIMINATOR);
     data.extend_from_slice(&max_input_amount.to_le_bytes());
     data.extend_from_slice(&exact_output_amount.to_le_bytes());
 
-    Ok(build_transaction(
-        signer,
-        blockhash,
-        &[
-            build_swap_instruction(signer.pubkey(), pool_info, leg, data)?,
-            build_uniquifier_memo_instruction(signer.pubkey(), uniquifier_memo),
-        ],
-    ))
+    let mut instructions = Vec::with_capacity(3);
+    if include_slot_assert {
+        instructions.push(build_assert_slot_instruction(target_slot));
+    }
+    instructions.push(build_swap_instruction(signer.pubkey(), pool_info, leg, data)?);
+    instructions.push(build_uniquifier_memo_instruction(
+        signer.pubkey(),
+        uniquifier_memo,
+    ));
+
+    Ok(build_transaction(signer, blockhash, &instructions))
 }
 
 fn build_swap_base_input_transaction(
@@ -432,20 +445,25 @@ fn build_swap_base_input_transaction(
     exact_input_amount: u64,
     minimum_output_amount: u64,
     uniquifier_memo: &str,
+    target_slot: Slot,
+    include_slot_assert: bool,
 ) -> Result<VersionedTransaction, BoxError> {
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SWAP_BASE_INPUT_DISCRIMINATOR);
     data.extend_from_slice(&exact_input_amount.to_le_bytes());
     data.extend_from_slice(&minimum_output_amount.to_le_bytes());
 
-    Ok(build_transaction(
-        signer,
-        blockhash,
-        &[
-            build_swap_instruction(signer.pubkey(), pool_info, leg, data)?,
-            build_uniquifier_memo_instruction(signer.pubkey(), uniquifier_memo),
-        ],
-    ))
+    let mut instructions = Vec::with_capacity(3);
+    if include_slot_assert {
+        instructions.push(build_assert_slot_instruction(target_slot));
+    }
+    instructions.push(build_swap_instruction(signer.pubkey(), pool_info, leg, data)?);
+    instructions.push(build_uniquifier_memo_instruction(
+        signer.pubkey(),
+        uniquifier_memo,
+    ));
+
+    Ok(build_transaction(signer, blockhash, &instructions))
 }
 
 fn build_swap_instruction(
