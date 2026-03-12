@@ -25,5 +25,6 @@ solana-signer = "=3.0.0"
 solana-transaction = "=3.0.2"
 spl-associated-token-account-interface = "=2.0.0"
 spl-memo-interface = "=2.0.0"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

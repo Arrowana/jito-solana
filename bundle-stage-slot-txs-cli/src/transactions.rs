@@ -2,16 +2,20 @@ mod memo;
 mod raydium_cp_swap;
 
 use {
-    crate::cli::TransactionMode,
+    crate::{
+        cli::{RaydiumCpSwapArgs, TransactionMode},
+        error::BoxError,
+    },
+    solana_address::Address,
     solana_clock::Slot,
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_rpc_client::rpc_client::RpcClient,
+    solana_rpc_client::nonblocking::rpc_client::RpcClient,
     solana_rpc_client_api::{
         bundles::RpcSimulateBundleResult, config::RpcSimulateTransactionAccountsConfig,
     },
     solana_transaction::versioned::VersionedTransaction,
-    std::error::Error,
+    std::io,
 };
 
 pub(crate) enum PreparedTransactions {
@@ -19,23 +23,72 @@ pub(crate) enum PreparedTransactions {
     RaydiumCpSwap(raydium_cp_swap::PreparedRaydiumCpSwap),
 }
 
-pub(crate) fn prepare_transactions(
+#[derive(Clone, Debug)]
+pub(crate) enum ResolvedTransactionMode {
+    Memo,
+    RaydiumCpSwap(ResolvedRaydiumCpSwapArgs),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolvedRaydiumCpSwapArgs {
+    pub pool: Address,
+    pub input_mint: Address,
+    pub input_amount: u64,
+}
+
+pub(crate) fn resolve_transaction_modes(
+    transaction_mode: &TransactionMode,
+    slot_count: usize,
+) -> Result<Vec<ResolvedTransactionMode>, BoxError> {
+    match transaction_mode {
+        TransactionMode::Memo => Ok((0..slot_count)
+            .map(|_| ResolvedTransactionMode::Memo)
+            .collect()),
+        TransactionMode::RaydiumCpSwap(args) => resolve_raydium_transaction_modes(args, slot_count),
+    }
+}
+
+fn resolve_raydium_transaction_modes(
+    args: &RaydiumCpSwapArgs,
+    slot_count: usize,
+) -> Result<Vec<ResolvedTransactionMode>, BoxError> {
+    if args.pools.len() < slot_count {
+        return Err(io::Error::other(format!(
+            "need at least {} configured pools for slot_count={}, got {}",
+            slot_count,
+            slot_count,
+            args.pools.len(),
+        ))
+        .into());
+    }
+
+    Ok(args
+        .pools
+        .iter()
+        .take(slot_count)
+        .copied()
+        .map(|pool| {
+            ResolvedTransactionMode::RaydiumCpSwap(ResolvedRaydiumCpSwapArgs {
+                pool,
+                input_mint: args.input_mint,
+                input_amount: args.input_amount,
+            })
+        })
+        .collect())
+}
+
+pub(crate) async fn prepare_transactions(
     rpc_client: &RpcClient,
     signer: &Keypair,
     blockhash: Hash,
-    transaction_mode: &TransactionMode,
+    transaction_mode: &ResolvedTransactionMode,
     target_slot: Slot,
-) -> Result<PreparedTransactions, Box<dyn Error>> {
+) -> Result<PreparedTransactions, BoxError> {
     match transaction_mode {
-        TransactionMode::Memo => Ok(PreparedTransactions::Memo),
-        TransactionMode::RaydiumCpSwap(args) => Ok(PreparedTransactions::RaydiumCpSwap(
-            raydium_cp_swap::prepare_transactions(
-                rpc_client,
-                signer,
-                blockhash,
-                args,
-                target_slot,
-            )?,
+        ResolvedTransactionMode::Memo => Ok(PreparedTransactions::Memo),
+        ResolvedTransactionMode::RaydiumCpSwap(args) => Ok(PreparedTransactions::RaydiumCpSwap(
+            raydium_cp_swap::prepare_transactions(rpc_client, signer, blockhash, args, target_slot)
+                .await?,
         )),
     }
 }
@@ -45,7 +98,7 @@ pub(crate) fn build_transactions(
     signer: &Keypair,
     blockhash: Hash,
     target_slot: Slot,
-) -> Result<Vec<VersionedTransaction>, Box<dyn Error>> {
+) -> Result<Vec<VersionedTransaction>, BoxError> {
     match prepared_transactions {
         PreparedTransactions::Memo => Ok(memo::build_transactions(signer, blockhash, target_slot)),
         PreparedTransactions::RaydiumCpSwap(prepared) => {
@@ -54,49 +107,49 @@ pub(crate) fn build_transactions(
     }
 }
 
-pub fn run_startup_setup(
+pub async fn run_startup_setup(
     rpc_client: &RpcClient,
     signer: &Keypair,
-    transaction_mode: &TransactionMode,
-) -> Result<(), Box<dyn Error>> {
-    match transaction_mode {
-        TransactionMode::Memo => Ok(()),
-        TransactionMode::RaydiumCpSwap(args) => {
-            raydium_cp_swap::run_startup_setup(rpc_client, signer, args)
+    transaction_modes: &[ResolvedTransactionMode],
+) -> Result<(), BoxError> {
+    for transaction_mode in transaction_modes {
+        match transaction_mode {
+            ResolvedTransactionMode::Memo => {}
+            ResolvedTransactionMode::RaydiumCpSwap(args) => {
+                raydium_cp_swap::run_startup_setup(rpc_client, signer, args).await?;
+            }
         }
     }
+
+    Ok(())
 }
 
 pub fn simulation_account_configs(
-    rpc_client: &RpcClient,
-    signer: &Keypair,
-    transaction_mode: &TransactionMode,
+    prepared_transactions: &PreparedTransactions,
     transaction_count: usize,
 ) -> Result<
     (
         Vec<Option<RpcSimulateTransactionAccountsConfig>>,
         Vec<Option<RpcSimulateTransactionAccountsConfig>>,
     ),
-    Box<dyn Error>,
+    BoxError,
 > {
-    match transaction_mode {
-        TransactionMode::Memo => Ok((vec![None; transaction_count], vec![None; transaction_count])),
-        TransactionMode::RaydiumCpSwap(args) => {
-            raydium_cp_swap::simulation_account_configs(rpc_client, signer, args, transaction_count)
+    match prepared_transactions {
+        PreparedTransactions::Memo => Ok((vec![None; transaction_count], vec![None; transaction_count])),
+        PreparedTransactions::RaydiumCpSwap(prepared) => {
+            raydium_cp_swap::simulation_account_configs(prepared, transaction_count)
         }
     }
 }
 
 pub fn log_post_simulation(
-    rpc_client: &RpcClient,
-    signer: &Keypair,
-    transaction_mode: &TransactionMode,
+    prepared_transactions: &PreparedTransactions,
     simulation_result: &RpcSimulateBundleResult,
-) -> Result<(), Box<dyn Error>> {
-    match transaction_mode {
-        TransactionMode::Memo => Ok(()),
-        TransactionMode::RaydiumCpSwap(args) => {
-            raydium_cp_swap::log_post_simulation(rpc_client, signer, args, simulation_result)
+) -> Result<(), BoxError> {
+    match prepared_transactions {
+        PreparedTransactions::Memo => Ok(()),
+        PreparedTransactions::RaydiumCpSwap(prepared) => {
+            raydium_cp_swap::log_post_simulation(prepared, simulation_result)
         }
     }
 }

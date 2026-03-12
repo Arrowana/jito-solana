@@ -655,6 +655,7 @@ dependencies = [
  "solana-transaction",
  "spl-associated-token-account-interface",
  "spl-memo-interface",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

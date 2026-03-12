@@ -1,6 +1,7 @@
 use {
     clap::{Args, Parser, Subcommand},
     solana_address::Address,
+    std::io,
 };
 
 #[derive(Clone, Debug, Parser)]
@@ -31,6 +32,25 @@ impl Config {
             .clone()
             .unwrap_or(TransactionMode::Memo)
     }
+
+    pub fn validate(&self) -> Result<(), io::Error> {
+        match self.selected_transaction_mode() {
+            TransactionMode::Memo => Ok(()),
+            TransactionMode::RaydiumCpSwap(args) => {
+                let expected_pool_count = usize::from(self.consecutive_slots);
+                if args.pools.len() != expected_pool_count {
+                    return Err(io::Error::other(format!(
+                        "raydium-cp-swap requires exactly {} --pool values for consecutive_slots={}, got {}",
+                        expected_pool_count,
+                        self.consecutive_slots,
+                        args.pools.len(),
+                    )));
+                }
+
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -50,8 +70,8 @@ impl TransactionMode {
 
 #[derive(Args, Clone, Debug)]
 pub struct RaydiumCpSwapArgs {
-    #[arg(long)]
-    pub pool: Address,
+    #[arg(long = "pool", required = true, num_args = 1..=4)]
+    pub pools: Vec<Address>,
 
     #[arg(long)]
     pub input_mint: Address,

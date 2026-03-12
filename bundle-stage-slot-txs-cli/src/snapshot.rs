@@ -1,9 +1,9 @@
 use {
+    crate::error::BoxError,
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_transaction::versioned::VersionedTransaction,
     std::{
-        error::Error,
         fs::{self, File},
         io::{self, Write},
         path::Path,
@@ -25,7 +25,7 @@ pub struct BaitAndDisappearSlotTransactions {
     pub transactions: Vec<VersionedTransaction>,
 }
 
-pub fn clear_snapshot_file(gap_duration_millis: u64) -> Result<(), Box<dyn Error>> {
+pub fn clear_snapshot_file(gap_duration_millis: u64) -> Result<(), BoxError> {
     write_snapshot_file(&BaitAndDisappearFile {
         gap_duration_millis,
         slot_transactions: Vec::new(),
@@ -35,14 +35,14 @@ pub fn clear_snapshot_file(gap_duration_millis: u64) -> Result<(), Box<dyn Error
 pub fn write_target_slots_snapshot(
     gap_duration_millis: u64,
     slot_transactions: Vec<BaitAndDisappearSlotTransactions>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), BoxError> {
     write_snapshot_file(&BaitAndDisappearFile {
         gap_duration_millis,
         slot_transactions,
     })
 }
 
-fn write_snapshot_file(snapshot: &BaitAndDisappearFile) -> Result<(), Box<dyn Error>> {
+fn write_snapshot_file(snapshot: &BaitAndDisappearFile) -> Result<(), BoxError> {
     let bytes = bincode::serialize(snapshot)?;
     if let Some(parent) = Path::new(BAIT_AND_DISAPPEAR_TXS_TEMP_PATH).parent() {
         fs::create_dir_all(parent)?;
@@ -55,7 +55,7 @@ fn write_snapshot_file(snapshot: &BaitAndDisappearFile) -> Result<(), Box<dyn Er
         BAIT_AND_DISAPPEAR_TXS_TEMP_PATH,
         BAIT_AND_DISAPPEAR_TXS_PATH,
     )
-    .map_err(|err| -> Box<dyn Error> {
+    .map_err(|err| -> BoxError {
         Box::new(io::Error::new(
             err.kind(),
             format!(

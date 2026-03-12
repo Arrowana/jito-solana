@@ -1,13 +1,11 @@
 use {
+    crate::error::BoxError,
     solana_address::Address,
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_commitment_config::CommitmentConfig,
-    solana_rpc_client::rpc_client::RpcClient,
+    solana_rpc_client::nonblocking::rpc_client::RpcClient,
     solana_rpc_client_api::config::RpcLeaderScheduleConfig,
-    std::{
-        error::Error,
-        time::{Duration, Instant},
-    },
+    std::time::{Duration, Instant},
 };
 
 pub const ARMING_WINDOW_SLOTS: Slot = 20;
@@ -46,22 +44,24 @@ impl TargetSlots {
     }
 }
 
-pub fn current_slot(rpc_client: &RpcClient) -> Result<Slot, Box<dyn Error>> {
-    Ok(rpc_client.get_slot_with_commitment(CommitmentConfig::processed())?)
+pub async fn current_slot(rpc_client: &RpcClient) -> Result<Slot, BoxError> {
+    Ok(rpc_client
+        .get_slot_with_commitment(CommitmentConfig::processed())
+        .await?)
 }
 
 impl LeaderScheduleCache {
-    pub fn target_slots(
+    pub async fn target_slots(
         &mut self,
         rpc_client: &RpcClient,
         identity: &Address,
         current_slot: Slot,
         consecutive_slots: usize,
-    ) -> Result<Option<TargetSlots>, Box<dyn Error>> {
+    ) -> Result<Option<TargetSlots>, BoxError> {
         if self.should_refresh(current_slot) {
             self.cached_schedule = Some(CachedLeaderSchedule {
                 refreshed_at: Instant::now(),
-                slots: fetch_leader_slots(rpc_client, identity)?,
+                slots: fetch_leader_slots(rpc_client, identity).await?,
             });
         }
 
@@ -92,12 +92,14 @@ impl LeaderScheduleCache {
     }
 }
 
-fn fetch_leader_slots(
+async fn fetch_leader_slots(
     rpc_client: &RpcClient,
     identity: &Address,
-) -> Result<Vec<Slot>, Box<dyn Error>> {
-    let epoch_info = rpc_client.get_epoch_info_with_commitment(CommitmentConfig::processed())?;
-    let epoch_schedule = rpc_client.get_epoch_schedule()?;
+) -> Result<Vec<Slot>, BoxError> {
+    let epoch_info = rpc_client
+        .get_epoch_info_with_commitment(CommitmentConfig::processed())
+        .await?;
+    let epoch_schedule = rpc_client.get_epoch_schedule().await?;
     let identity_string = identity.to_string();
     let mut all_slots = Vec::new();
 
@@ -110,7 +112,8 @@ fn fetch_leader_slots(
                 commitment: Some(CommitmentConfig::processed()),
                 ..RpcLeaderScheduleConfig::default()
             },
-        )?
+        )
+        .await?
         else {
             continue;
         };
