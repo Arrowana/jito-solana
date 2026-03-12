@@ -1,4 +1,5 @@
 mod cli;
+mod error;
 mod logging;
 mod schedule;
 mod simulation;
@@ -8,6 +9,7 @@ mod transactions;
 use {
     clap::Parser,
     cli::Config,
+    error::BoxError,
     logging::init_logging,
     schedule::{
         countdown_log_bucket, current_slot, estimated_time_to_target, format_eta,
@@ -20,25 +22,37 @@ use {
         BAIT_AND_DISAPPEAR_TXS_PATH,
     },
     solana_clock::Slot,
-    solana_keypair::read_keypair_file,
-    solana_rpc_client::rpc_client::RpcClient,
-    std::{error::Error, thread, time::Duration},
+    solana_hash::Hash,
+    solana_keypair::{read_keypair_file, Keypair},
+    solana_rpc_client::nonblocking::rpc_client::RpcClient,
+    std::{io, sync::Arc, time::Duration},
+    tokio::{task::JoinSet, time::sleep},
     tracing::{error, info},
     transactions::{
-        build_transactions, log_post_simulation, prepare_transactions, run_startup_setup,
-        simulation_account_configs,
+        build_transactions, log_post_simulation, prepare_transactions, resolve_transaction_modes,
+        run_startup_setup, simulation_account_configs, ResolvedTransactionMode,
     },
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1_000);
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), BoxError> {
     init_logging();
 
     let config = Config::parse();
+    config.validate()?;
+
     let transaction_mode = config.selected_transaction_mode();
-    let rpc_client = RpcClient::new(config.rpc_url.clone());
-    let signer = read_keypair_file(&config.keypair)?;
+    let configured_transaction_modes =
+        resolve_transaction_modes(&transaction_mode, usize::from(config.consecutive_slots))?;
+    let rpc_client = Arc::new(RpcClient::new(config.rpc_url.clone()));
+    let signer = Arc::new(read_keypair_file(&config.keypair).map_err(|err| {
+        io::Error::other(format!(
+            "failed to read keypair from {}: {err}",
+            config.keypair,
+        ))
+    })?);
     let mut published_state = PublishedState::Cleared;
     let mut previous_target_slots = None;
     let mut previous_countdown_bucket = None;
@@ -54,24 +68,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         transaction_mode = transaction_mode.label(),
         "started bundle-stage slot tx monitor",
     );
-    run_startup_setup(&rpc_client, &signer, &transaction_mode)?;
+    run_startup_setup(
+        rpc_client.as_ref(),
+        signer.as_ref(),
+        &configured_transaction_modes,
+    )
+    .await?;
 
     loop {
-        let current_slot = match current_slot(&rpc_client) {
+        let current_slot = match current_slot(rpc_client.as_ref()).await {
             Ok(current_slot) => current_slot,
             Err(err) => {
                 error!(err = %err, "failed to fetch current slot");
-                thread::sleep(POLL_INTERVAL);
+                sleep(POLL_INTERVAL).await;
                 continue;
             }
         };
 
-        let target_slots = match leader_schedule_cache.target_slots(
-            &rpc_client,
-            &config.identity,
-            current_slot,
-            usize::from(config.consecutive_slots),
-        )
+        let target_slots = match leader_schedule_cache
+            .target_slots(
+                rpc_client.as_ref(),
+                &config.identity,
+                current_slot,
+                usize::from(config.consecutive_slots),
+            )
+            .await
         {
             Ok(Some(target_slots)) => target_slots,
             Ok(None) => {
@@ -82,14 +103,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             Err(err) => {
                 error!(current_slot, err = %err, "failed to determine next target slot");
-                thread::sleep(POLL_INTERVAL);
+                sleep(POLL_INTERVAL).await;
                 continue;
             }
         };
 
         if previous_target_slots.as_ref() != Some(&target_slots) {
-            let remaining_slots =
-                remaining_slots_to_target(target_slots.start_slot(), current_slot);
+            let remaining_slots = remaining_slots_to_target(target_slots.start_slot(), current_slot);
             let eta = estimated_time_to_target(target_slots.start_slot(), current_slot);
             info!(
                 current_slot,
@@ -127,86 +147,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 start_slot,
                 last_slot,
             } if published_state != next_published_state => {
-                let blockhash = match rpc_client.get_latest_blockhash() {
+                let blockhash = match rpc_client.get_latest_blockhash().await {
                     Ok(blockhash) => blockhash,
                     Err(err) => {
                         error!(start_slot, last_slot, err = %err, "failed to fetch latest blockhash");
-                        thread::sleep(POLL_INTERVAL);
+                        sleep(POLL_INTERVAL).await;
                         continue;
                     }
                 };
 
-                let prepared_transactions = match prepare_transactions(
-                    &rpc_client,
-                    &signer,
+                let slot_transaction_modes = configured_transaction_modes
+                    .iter()
+                    .take(target_slots.slots.len())
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                let slot_transactions = match prepare_target_slots(
+                    rpc_client.clone(),
+                    signer.clone(),
                     blockhash,
-                    &transaction_mode,
-                    start_slot,
-                ) {
-                    Ok(prepared_transactions) => prepared_transactions,
-                    Err(err) => {
-                        clear_stale_snapshot_if_needed(
-                            config.gap_duration_millis,
-                            &mut published_state,
-                            current_slot,
-                        )?;
-                        error!(start_slot, err = %err, "failed to prepare target transactions");
-                        thread::sleep(POLL_INTERVAL);
-                        continue;
-                    }
-                };
-
-                let simulated_transactions = match build_transactions(
-                    &prepared_transactions,
-                    &signer,
-                    blockhash,
-                    start_slot,
-                ) {
-                    Ok(transactions) => transactions,
-                    Err(err) => {
-                        clear_stale_snapshot_if_needed(
-                            config.gap_duration_millis,
-                            &mut published_state,
-                            current_slot,
-                        )?;
-                        error!(start_slot, err = %err, "failed to build simulated target transactions");
-                        thread::sleep(POLL_INTERVAL);
-                        continue;
-                    }
-                };
-
-                let (pre_execution_accounts_configs, post_execution_accounts_configs) =
-                    match simulation_account_configs(
-                        &rpc_client,
-                        &signer,
-                        &transaction_mode,
-                        simulated_transactions.len(),
-                    ) {
-                        Ok(configs) => configs,
-                        Err(err) => {
-                            clear_stale_snapshot_if_needed(
-                                config.gap_duration_millis,
-                                &mut published_state,
-                                current_slot,
-                            )?;
-                            error!(
-                                start_slot,
-                                err = %err,
-                                "failed to prepare bundle simulation account configs",
-                            );
-                            thread::sleep(POLL_INTERVAL);
-                            continue;
-                        }
-                    };
-
-                let simulation_result = match simulate_bundle_with_accounts(
-                    &rpc_client,
-                    start_slot,
-                    &simulated_transactions,
-                    pre_execution_accounts_configs,
-                    post_execution_accounts_configs,
-                ) {
-                    Ok(simulation_result) => simulation_result,
+                    &target_slots.slots,
+                    slot_transaction_modes,
+                )
+                .await
+                {
+                    Ok(slot_transactions) => slot_transactions,
                     Err(err) => {
                         clear_stale_snapshot_if_needed(
                             config.gap_duration_millis,
@@ -214,72 +179,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                             current_slot,
                         )?;
                         error!(
-                            start_slot,
+                            target_start_slot = start_slot,
+                            target_last_slot = last_slot,
                             err = %err,
-                            "bundle simulation failed, not publishing snapshot",
+                            "failed to prepare target slot transactions",
                         );
-                        thread::sleep(POLL_INTERVAL);
+                        sleep(POLL_INTERVAL).await;
                         continue;
                     }
                 };
-
-                if let Err(err) = log_post_simulation(
-                    &rpc_client,
-                    &signer,
-                    &transaction_mode,
-                    &simulation_result,
-                ) {
-                    clear_stale_snapshot_if_needed(
-                        config.gap_duration_millis,
-                        &mut published_state,
-                        current_slot,
-                    )?;
-                    error!(
-                        start_slot,
-                        err = %err,
-                        "failed to log bundle simulation details",
-                    );
-                    thread::sleep(POLL_INTERVAL);
-                    continue;
-                }
-
-                let mut slot_transactions = Vec::with_capacity(target_slots.slots.len());
-                slot_transactions.push(BaitAndDisappearSlotTransactions {
-                    slot: start_slot,
-                    transactions: simulated_transactions,
-                });
-
-                let mut build_failed = false;
-                for slot in target_slots.slots.iter().skip(1) {
-                    let transactions = match build_transactions(
-                        &prepared_transactions,
-                        &signer,
-                        blockhash,
-                        *slot,
-                    ) {
-                        Ok(transactions) => transactions,
-                        Err(err) => {
-                            clear_stale_snapshot_if_needed(
-                                config.gap_duration_millis,
-                                &mut published_state,
-                                current_slot,
-                            )?;
-                            error!(slot, err = %err, "failed to build target transactions");
-                            build_failed = true;
-                            thread::sleep(POLL_INTERVAL);
-                            break;
-                        }
-                    };
-
-                    slot_transactions.push(BaitAndDisappearSlotTransactions {
-                        slot: *slot,
-                        transactions,
-                    });
-                }
-
-                if build_failed {
-                    continue;
-                }
 
                 write_target_slots_snapshot(config.gap_duration_millis, slot_transactions)?;
                 info!(
@@ -307,15 +215,129 @@ fn main() -> Result<(), Box<dyn Error>> {
             _ => {}
         }
 
-        thread::sleep(POLL_INTERVAL);
+        sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn prepare_target_slots(
+    rpc_client: Arc<RpcClient>,
+    signer: Arc<Keypair>,
+    blockhash: Hash,
+    target_slots: &[Slot],
+    transaction_modes: Vec<ResolvedTransactionMode>,
+) -> Result<Vec<BaitAndDisappearSlotTransactions>, BoxError> {
+    let mut join_set = JoinSet::new();
+
+    for (target_slot, transaction_mode) in target_slots
+        .iter()
+        .copied()
+        .zip(transaction_modes.into_iter())
+    {
+        let rpc_client = rpc_client.clone();
+        let signer = signer.clone();
+        join_set.spawn(async move {
+            prepare_target_slot(rpc_client, signer, blockhash, target_slot, transaction_mode).await
+        });
+    }
+
+    let mut slot_transactions = Vec::with_capacity(target_slots.len());
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok(Ok(slot_entry)) => slot_transactions.push(slot_entry),
+            Ok(Err(err)) => {
+                join_set.abort_all();
+                return Err(err);
+            }
+            Err(err) => {
+                join_set.abort_all();
+                return Err(io::Error::other(format!(
+                    "target slot task join failure: {err}",
+                ))
+                .into());
+            }
+        }
+    }
+
+    slot_transactions.sort_unstable_by_key(|slot_entry| slot_entry.slot);
+    Ok(slot_transactions)
+}
+
+async fn prepare_target_slot(
+    rpc_client: Arc<RpcClient>,
+    signer: Arc<Keypair>,
+    blockhash: Hash,
+    target_slot: Slot,
+    transaction_mode: ResolvedTransactionMode,
+) -> Result<BaitAndDisappearSlotTransactions, BoxError> {
+    let prepared_transactions = prepare_transactions(
+        rpc_client.as_ref(),
+        signer.as_ref(),
+        blockhash,
+        &transaction_mode,
+        target_slot,
+    )
+    .await
+    .map_err(|err| {
+        io::Error::other(format!(
+            "failed to prepare transactions for slot {}: {err}",
+            target_slot,
+        ))
+    })?;
+
+    let transactions = build_transactions(
+        &prepared_transactions,
+        signer.as_ref(),
+        blockhash,
+        target_slot,
+    )
+    .map_err(|err| {
+        io::Error::other(format!(
+            "failed to build transactions for slot {}: {err}",
+            target_slot,
+        ))
+    })?;
+
+    let (pre_execution_accounts_configs, post_execution_accounts_configs) =
+        simulation_account_configs(&prepared_transactions, transactions.len()).map_err(|err| {
+            io::Error::other(format!(
+                "failed to build simulation account configs for slot {}: {err}",
+                target_slot,
+            ))
+        })?;
+
+    let simulation_result = simulate_bundle_with_accounts(
+        rpc_client.as_ref(),
+        target_slot,
+        &transactions,
+        pre_execution_accounts_configs,
+        post_execution_accounts_configs,
+    )
+    .await
+    .map_err(|err| {
+        io::Error::other(format!(
+            "bundle simulation failed for slot {}: {err}",
+            target_slot,
+        ))
+    })?;
+
+    log_post_simulation(&prepared_transactions, &simulation_result).map_err(|err| {
+        io::Error::other(format!(
+            "failed to log simulation details for slot {}: {err}",
+            target_slot,
+        ))
+    })?;
+
+    Ok(BaitAndDisappearSlotTransactions {
+        slot: target_slot,
+        transactions,
+    })
 }
 
 fn clear_stale_snapshot_if_needed(
     gap_duration_millis: u64,
     published_state: &mut PublishedState,
     current_slot: Slot,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), BoxError> {
     if *published_state != PublishedState::Cleared
         && !published_state_is_within_grace_window(published_state, current_slot)
     {

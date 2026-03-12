@@ -1,5 +1,8 @@
 use {
-    crate::cli::RaydiumCpSwapArgs,
+    crate::{
+        error::BoxError,
+        transactions::ResolvedRaydiumCpSwapArgs,
+    },
     bytemuck::{Pod, Zeroable},
     solana_address::{address, Address},
     solana_clock::Slot,
@@ -7,7 +10,7 @@ use {
     solana_hash::Hash,
     solana_instruction::{AccountMeta, Instruction},
     solana_keypair::Keypair,
-    solana_rpc_client::rpc_client::RpcClient,
+    solana_rpc_client::nonblocking::rpc_client::RpcClient,
     solana_rpc_client_api::{
         bundles::{
             RpcBundleSimulationSummary, RpcSimulateBundleConfig, RpcSimulateBundleResult,
@@ -22,7 +25,7 @@ use {
         address::get_associated_token_address_with_program_id,
         instruction::create_associated_token_account_idempotent,
     },
-    std::{error::Error, io, mem::size_of},
+    std::{io, mem::size_of},
     tracing::info,
 };
 
@@ -59,14 +62,14 @@ pub(crate) struct PreparedRaydiumCpSwap {
     first_leg_max_input_amount: u64,
 }
 
-pub(super) fn prepare_transactions(
+pub(super) async fn prepare_transactions(
     rpc_client: &RpcClient,
     signer: &Keypair,
     blockhash: Hash,
-    args: &RaydiumCpSwapArgs,
+    args: &ResolvedRaydiumCpSwapArgs,
     target_slot: Slot,
-) -> Result<PreparedRaydiumCpSwap, Box<dyn Error>> {
-    let pool_info = RaydiumCpSwapPoolInfo::load(rpc_client, args.pool)?;
+) -> Result<PreparedRaydiumCpSwap, BoxError> {
+    let pool_info = RaydiumCpSwapPoolInfo::load(rpc_client, args.pool).await?;
     let route = pool_info.round_trip_route(signer.pubkey(), args.input_mint)?;
     let first_leg_uniquifier = slot_uniquifier_memo(target_slot, 1);
     let simulated_first_leg_transaction = build_swap_base_input_transaction(
@@ -78,11 +81,8 @@ pub(super) fn prepare_transactions(
         0,
         &first_leg_uniquifier,
     )?;
-    let first_leg_simulation = simulate_first_leg(
-        rpc_client,
-        &simulated_first_leg_transaction,
-        &route.first_leg,
-    )?;
+    let first_leg_simulation =
+        simulate_first_leg(rpc_client, &simulated_first_leg_transaction, &route.first_leg).await?;
     let first_leg_max_input_amount = inflate_amount_by_five_percent(args.input_amount)?;
 
     info!(
@@ -112,7 +112,7 @@ pub(super) fn build_transactions(
     signer: &Keypair,
     blockhash: Hash,
     target_slot: Slot,
-) -> Result<Vec<VersionedTransaction>, Box<dyn Error>> {
+) -> Result<Vec<VersionedTransaction>, BoxError> {
     let first_leg_uniquifier = slot_uniquifier_memo(target_slot, 1);
     let second_leg_uniquifier = slot_uniquifier_memo(target_slot, 2);
 
@@ -138,15 +138,16 @@ pub(super) fn build_transactions(
     ])
 }
 
-pub fn run_startup_setup(
+pub async fn run_startup_setup(
     rpc_client: &RpcClient,
     signer: &Keypair,
-    args: &RaydiumCpSwapArgs,
-) -> Result<(), Box<dyn Error>> {
-    let pool_info = RaydiumCpSwapPoolInfo::load(rpc_client, args.pool)?;
+    args: &ResolvedRaydiumCpSwapArgs,
+) -> Result<(), BoxError> {
+    let pool_info = RaydiumCpSwapPoolInfo::load(rpc_client, args.pool).await?;
     let route = pool_info.round_trip_route(signer.pubkey(), args.input_mint)?;
     let initialize_user_accounts_instructions =
-        build_initialize_user_token_account_instructions(rpc_client, signer.pubkey(), &route)?;
+        build_initialize_user_token_account_instructions(rpc_client, signer.pubkey(), &route)
+            .await?;
 
     if initialize_user_accounts_instructions.is_empty() {
         info!(
@@ -156,9 +157,9 @@ pub fn run_startup_setup(
         return Ok(());
     }
 
-    let blockhash = rpc_client.get_latest_blockhash()?;
+    let blockhash = rpc_client.get_latest_blockhash().await?;
     let setup_transaction = build_transaction(signer, blockhash, &initialize_user_accounts_instructions);
-    let signature = rpc_client.send_and_confirm_transaction(&setup_transaction)?;
+    let signature = rpc_client.send_and_confirm_transaction(&setup_transaction).await?;
     info!(
         pool = %pool_info.pool,
         signature = %signature,
@@ -183,8 +184,8 @@ struct RaydiumCpSwapPoolInfo {
 }
 
 impl RaydiumCpSwapPoolInfo {
-    fn load(rpc_client: &RpcClient, pool: Address) -> Result<Self, Box<dyn Error>> {
-        let account = rpc_client.get_account(&pool)?;
+    async fn load(rpc_client: &RpcClient, pool: Address) -> Result<Self, BoxError> {
+        let account = rpc_client.get_account(&pool).await?;
         if account.owner != RAYDIUM_CP_SWAP_PROGRAM_ID {
             return Err(io::Error::other(format!(
                 "pool {} is owned by {}, expected raydium cp-swap program {}",
@@ -196,7 +197,7 @@ impl RaydiumCpSwapPoolInfo {
         Self::from_account_data(pool, &account.data)
     }
 
-    fn from_account_data(pool: Address, data: &[u8]) -> Result<Self, Box<dyn Error>> {
+    fn from_account_data(pool: Address, data: &[u8]) -> Result<Self, BoxError> {
         if data.len() < POOL_STATE_RAW_LEN {
             return Err(io::Error::other(format!(
                 "pool {} account data is too short: {} bytes",
@@ -236,7 +237,7 @@ impl RaydiumCpSwapPoolInfo {
         })
     }
 
-    fn authority(&self) -> Result<Address, Box<dyn Error>> {
+    fn authority(&self) -> Result<Address, BoxError> {
         Address::create_program_address(
             &[RAYDIUM_AUTH_SEED, &[self.auth_bump]],
             &RAYDIUM_CP_SWAP_PROGRAM_ID,
@@ -254,7 +255,7 @@ impl RaydiumCpSwapPoolInfo {
         &self,
         user: Address,
         first_leg_input_mint: Address,
-    ) -> Result<RoundTripRoute, Box<dyn Error>> {
+    ) -> Result<RoundTripRoute, BoxError> {
         let first_leg = if first_leg_input_mint == self.token_0_mint {
             SwapLeg::new(
                 user,
@@ -356,15 +357,16 @@ struct RoundTripRoute {
     second_leg: SwapLeg,
 }
 
-fn build_initialize_user_token_account_instructions(
+async fn build_initialize_user_token_account_instructions(
     rpc_client: &RpcClient,
     payer: Address,
     route: &RoundTripRoute,
-) -> Result<Vec<Instruction>, Box<dyn Error>> {
+) -> Result<Vec<Instruction>, BoxError> {
     let accounts = rpc_client.get_multiple_accounts(&[
         route.user_input_token_account,
         route.user_output_token_account,
-    ])?;
+    ])
+    .await?;
     let mut instructions = Vec::new();
 
     if accounts[0].is_none() {
@@ -406,7 +408,7 @@ fn build_swap_base_output_transaction(
     max_input_amount: u64,
     exact_output_amount: u64,
     uniquifier_memo: &str,
-) -> Result<VersionedTransaction, Box<dyn Error>> {
+) -> Result<VersionedTransaction, BoxError> {
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SWAP_BASE_OUTPUT_DISCRIMINATOR);
     data.extend_from_slice(&max_input_amount.to_le_bytes());
@@ -430,7 +432,7 @@ fn build_swap_base_input_transaction(
     exact_input_amount: u64,
     minimum_output_amount: u64,
     uniquifier_memo: &str,
-) -> Result<VersionedTransaction, Box<dyn Error>> {
+) -> Result<VersionedTransaction, BoxError> {
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SWAP_BASE_INPUT_DISCRIMINATOR);
     data.extend_from_slice(&exact_input_amount.to_le_bytes());
@@ -451,7 +453,7 @@ fn build_swap_instruction(
     pool_info: &RaydiumCpSwapPoolInfo,
     leg: &SwapLeg,
     data: Vec<u8>,
-) -> Result<Instruction, Box<dyn Error>> {
+) -> Result<Instruction, BoxError> {
     let authority = pool_info.authority()?;
 
     Ok(Instruction {
@@ -508,11 +510,11 @@ struct FirstLegSimulation {
     price_impact_bps: u64,
 }
 
-fn simulate_first_leg(
+async fn simulate_first_leg(
     rpc_client: &RpcClient,
     first_leg_transaction: &VersionedTransaction,
     first_leg: &SwapLeg,
-) -> Result<FirstLegSimulation, Box<dyn Error>> {
+) -> Result<FirstLegSimulation, BoxError> {
     let account_config = RpcSimulateTransactionAccountsConfig {
         encoding: Some(UiAccountEncoding::Base64),
         addresses: vec![
@@ -534,7 +536,8 @@ fn simulate_first_leg(
                 skip_sig_verify: false,
                 ..RpcSimulateBundleConfig::default()
             },
-        )?
+        )
+        .await?
         .value;
 
     match simulation_result.summary {
@@ -623,7 +626,7 @@ fn simulate_first_leg(
     })
 }
 
-fn parse_token_amount(ui_account: Option<&UiAccount>) -> Result<u64, Box<dyn Error>> {
+fn parse_token_amount(ui_account: Option<&UiAccount>) -> Result<u64, BoxError> {
     let ui_account = ui_account
         .ok_or_else(|| io::Error::other("missing token account state in simulation response"))?;
     if let UiAccountData::Json(parsed_account) = &ui_account.data {
@@ -653,7 +656,7 @@ fn parse_token_amount(ui_account: Option<&UiAccount>) -> Result<u64, Box<dyn Err
     })?))
 }
 
-fn inflate_amount_by_five_percent(amount: u64) -> Result<u64, Box<dyn Error>> {
+fn inflate_amount_by_five_percent(amount: u64) -> Result<u64, BoxError> {
     amount
         .checked_mul(105)
         .and_then(|value| value.checked_add(99))
@@ -667,7 +670,7 @@ fn compute_price_impact_bps(
     output_vault_before: u64,
     pool_input_amount: u64,
     pool_output_amount: u64,
-) -> Result<u64, Box<dyn Error>> {
+) -> Result<u64, BoxError> {
     if input_vault_before == 0 || output_vault_before == 0 {
         return Err(io::Error::other("raydium pool reserves must be non-zero").into());
     }
@@ -683,22 +686,18 @@ fn compute_price_impact_bps(
 }
 
 pub fn simulation_account_configs(
-    rpc_client: &RpcClient,
-    signer: &Keypair,
-    args: &RaydiumCpSwapArgs,
+    prepared: &PreparedRaydiumCpSwap,
     transaction_count: usize,
 ) -> Result<
     (
         Vec<Option<RpcSimulateTransactionAccountsConfig>>,
         Vec<Option<RpcSimulateTransactionAccountsConfig>>,
     ),
-    Box<dyn Error>,
+    BoxError,
 > {
-    let pool_info = RaydiumCpSwapPoolInfo::load(rpc_client, args.pool)?;
-    let route = pool_info.round_trip_route(signer.pubkey(), args.input_mint)?;
     let account_config = Some(RpcSimulateTransactionAccountsConfig {
         encoding: Some(UiAccountEncoding::Base64),
-        addresses: vec![route.user_input_token_account.to_string()],
+        addresses: vec![prepared.route.user_input_token_account.to_string()],
     });
 
     Ok((
@@ -708,13 +707,9 @@ pub fn simulation_account_configs(
 }
 
 pub fn log_post_simulation(
-    rpc_client: &RpcClient,
-    signer: &Keypair,
-    args: &RaydiumCpSwapArgs,
+    prepared: &PreparedRaydiumCpSwap,
     simulation_result: &RpcSimulateBundleResult,
-) -> Result<(), Box<dyn Error>> {
-    let pool_info = RaydiumCpSwapPoolInfo::load(rpc_client, args.pool)?;
-    let route = pool_info.round_trip_route(signer.pubkey(), args.input_mint)?;
+) -> Result<(), BoxError> {
     let first_transaction = simulation_result
         .transaction_results
         .first()
@@ -753,8 +748,8 @@ pub fn log_post_simulation(
         i128::from(second_leg_input_after) - i128::from(first_leg_input_before);
 
     info!(
-        pool = %pool_info.pool,
-        input_mint = %route.first_leg.input_mint,
+        pool = %prepared.pool_info.pool,
+        input_mint = %prepared.route.first_leg.input_mint,
         returned_input_amount,
         bundle_input_delta,
         "simulated raydium bundle input returned after unwinding intermediate output",

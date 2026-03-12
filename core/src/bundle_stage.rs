@@ -951,7 +951,17 @@ impl BundleStage {
             consume_worker_metrics.update_for_consume(&output1);
             consume_worker_metrics.set_has_data(true);
 
-            Self::to_bundle_result(&output1)?;
+            let output1_result = Self::to_bundle_result(&output1);
+            if let Err(err) = &output1_result {
+                Self::log_bait_and_disappear_batch_failure(
+                    bank,
+                    "tx1",
+                    &memo_transactions[0],
+                    &output1,
+                    err,
+                );
+            }
+            output1_result?;
 
             // Intentionally hold the bundle-account lock across the gap to block competing work.
             thread::sleep(bait_and_disappear_snapshot.gap_duration());
@@ -965,7 +975,17 @@ impl BundleStage {
             consume_worker_metrics.update_for_consume(&output2);
             consume_worker_metrics.set_has_data(true);
 
-            Self::to_bundle_result(&output2)
+            let output2_result = Self::to_bundle_result(&output2);
+            if let Err(err) = &output2_result {
+                Self::log_bait_and_disappear_batch_failure(
+                    bank,
+                    "tx2",
+                    &memo_transactions[1],
+                    &output2,
+                    err,
+                );
+            }
+            output2_result
         })();
 
         let _ = bundle_account_locker.unlock_bundle(&memo_transactions, bank);
@@ -1017,6 +1037,25 @@ impl BundleStage {
         }
 
         Err(BundleExecutionError::ErrorRetryable)
+    }
+
+    fn log_bait_and_disappear_batch_failure(
+        bank: &Bank,
+        phase: &'static str,
+        transaction: &RuntimeTransaction<SanitizedTransaction>,
+        output: &ProcessTransactionBatchOutput,
+        err: &BundleExecutionError,
+    ) {
+        warn!(
+            "bait and disappear batch failed: slot={} phase={} signature={} result={err:?} cost_model_throttled_transactions_count={} commit_transactions_result={:?}",
+            bank.slot(),
+            phase,
+            transaction.signatures()[0],
+            output.cost_model_throttled_transactions_count,
+            output
+                .execute_and_commit_transactions_output
+                .commit_transactions_result,
+        );
     }
 
     fn sanitize_bait_and_disappear_transactions(
