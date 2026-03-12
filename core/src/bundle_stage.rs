@@ -922,8 +922,8 @@ impl BundleStage {
 
             let output2 = consumer.process_and_record_aged_transactions(
                 bank,
-                &memo_transactions[..1],
-                &max_ages[..1],
+                &memo_transactions[1..],
+                &max_ages[1..],
                 MAX_BUNDLE_RETRY_DURATION,
             );
             consume_worker_metrics.update_for_consume(&output2);
