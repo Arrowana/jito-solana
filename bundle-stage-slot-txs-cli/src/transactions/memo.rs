@@ -12,8 +12,8 @@ pub fn build_transactions(
     target_slot: Slot,
 ) -> Vec<VersionedTransaction> {
     vec![
-        build_memo_transaction(signer, "Bob", &uniquifier_memo(target_slot, 1), blockhash),
-        build_memo_transaction(signer, "Alice", &uniquifier_memo(target_slot, 2), blockhash),
+        build_memo_transaction(signer, "Bob", &uniquifier_memo(target_slot), blockhash),
+        build_memo_transaction(signer, "Alice", &uniquifier_memo(target_slot), blockhash),
     ]
 }
 
