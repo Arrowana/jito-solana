@@ -153,6 +153,7 @@ exclude = [
     "ci/xtask",
     "dev-bins",
     "programs/sbf",
+    "slot-assert-pinocchio-program",
     "svm/tests/example-programs",
 ]
 

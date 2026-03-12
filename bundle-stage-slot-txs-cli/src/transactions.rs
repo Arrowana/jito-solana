@@ -98,11 +98,23 @@ pub(crate) fn build_transactions(
     signer: &Keypair,
     blockhash: Hash,
     target_slot: Slot,
+    include_slot_assert: bool,
 ) -> Result<Vec<VersionedTransaction>, BoxError> {
     match prepared_transactions {
-        PreparedTransactions::Memo => Ok(memo::build_transactions(signer, blockhash, target_slot)),
+        PreparedTransactions::Memo => Ok(memo::build_transactions(
+            signer,
+            blockhash,
+            target_slot,
+            include_slot_assert,
+        )),
         PreparedTransactions::RaydiumCpSwap(prepared) => {
-            raydium_cp_swap::build_transactions(prepared, signer, blockhash, target_slot)
+            raydium_cp_swap::build_transactions(
+                prepared,
+                signer,
+                blockhash,
+                target_slot,
+                include_slot_assert,
+            )
         }
     }
 }
