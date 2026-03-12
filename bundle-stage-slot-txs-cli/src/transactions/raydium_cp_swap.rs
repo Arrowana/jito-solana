@@ -2,6 +2,7 @@ use {
     crate::cli::RaydiumCpSwapArgs,
     bytemuck::{Pod, Zeroable},
     solana_address::{address, Address},
+    solana_clock::Slot,
     solana_commitment_config::CommitmentConfig,
     solana_hash::Hash,
     solana_instruction::{AccountMeta, Instruction},
@@ -51,14 +52,23 @@ struct PoolStateRaw {
     status: u8,
 }
 
-pub fn build_transactions(
+pub(crate) struct PreparedRaydiumCpSwap {
+    pool_info: RaydiumCpSwapPoolInfo,
+    route: RoundTripRoute,
+    first_leg_simulation: FirstLegSimulation,
+    first_leg_max_input_amount: u64,
+}
+
+pub(super) fn prepare_transactions(
     rpc_client: &RpcClient,
     signer: &Keypair,
     blockhash: Hash,
     args: &RaydiumCpSwapArgs,
-) -> Result<Vec<VersionedTransaction>, Box<dyn Error>> {
+    target_slot: Slot,
+) -> Result<PreparedRaydiumCpSwap, Box<dyn Error>> {
     let pool_info = RaydiumCpSwapPoolInfo::load(rpc_client, args.pool)?;
     let route = pool_info.round_trip_route(signer.pubkey(), args.input_mint)?;
+    let first_leg_uniquifier = slot_uniquifier_memo(target_slot, 1);
     let simulated_first_leg_transaction = build_swap_base_input_transaction(
         signer,
         blockhash,
@@ -66,6 +76,7 @@ pub fn build_transactions(
         &route.first_leg,
         args.input_amount,
         0,
+        &first_leg_uniquifier,
     )?;
     let first_leg_simulation = simulate_first_leg(
         rpc_client,
@@ -88,22 +99,41 @@ pub fn build_transactions(
         "simulated first raydium base-input trade impact",
     );
 
+    Ok(PreparedRaydiumCpSwap {
+        pool_info,
+        route,
+        first_leg_simulation,
+        first_leg_max_input_amount,
+    })
+}
+
+pub(super) fn build_transactions(
+    prepared: &PreparedRaydiumCpSwap,
+    signer: &Keypair,
+    blockhash: Hash,
+    target_slot: Slot,
+) -> Result<Vec<VersionedTransaction>, Box<dyn Error>> {
+    let first_leg_uniquifier = slot_uniquifier_memo(target_slot, 1);
+    let second_leg_uniquifier = slot_uniquifier_memo(target_slot, 2);
+
     Ok(vec![
         build_swap_base_output_transaction(
             signer,
             blockhash,
-            &pool_info,
-            &route.first_leg,
-            first_leg_max_input_amount,
-            first_leg_simulation.user_output_amount,
+            &prepared.pool_info,
+            &prepared.route.first_leg,
+            prepared.first_leg_max_input_amount,
+            prepared.first_leg_simulation.user_output_amount,
+            &first_leg_uniquifier,
         )?,
         build_swap_base_input_transaction(
             signer,
             blockhash,
-            &pool_info,
-            &route.second_leg,
-            first_leg_simulation.user_output_amount,
+            &prepared.pool_info,
+            &prepared.route.second_leg,
+            prepared.first_leg_simulation.user_output_amount,
             0,
+            &second_leg_uniquifier,
         )?,
     ])
 }
@@ -375,6 +405,7 @@ fn build_swap_base_output_transaction(
     leg: &SwapLeg,
     max_input_amount: u64,
     exact_output_amount: u64,
+    uniquifier_memo: &str,
 ) -> Result<VersionedTransaction, Box<dyn Error>> {
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SWAP_BASE_OUTPUT_DISCRIMINATOR);
@@ -384,7 +415,10 @@ fn build_swap_base_output_transaction(
     Ok(build_transaction(
         signer,
         blockhash,
-        &[build_swap_instruction(signer.pubkey(), pool_info, leg, data)?],
+        &[
+            build_swap_instruction(signer.pubkey(), pool_info, leg, data)?,
+            build_uniquifier_memo_instruction(signer.pubkey(), uniquifier_memo),
+        ],
     ))
 }
 
@@ -395,6 +429,7 @@ fn build_swap_base_input_transaction(
     leg: &SwapLeg,
     exact_input_amount: u64,
     minimum_output_amount: u64,
+    uniquifier_memo: &str,
 ) -> Result<VersionedTransaction, Box<dyn Error>> {
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SWAP_BASE_INPUT_DISCRIMINATOR);
@@ -404,7 +439,10 @@ fn build_swap_base_input_transaction(
     Ok(build_transaction(
         signer,
         blockhash,
-        &[build_swap_instruction(signer.pubkey(), pool_info, leg, data)?],
+        &[
+            build_swap_instruction(signer.pubkey(), pool_info, leg, data)?,
+            build_uniquifier_memo_instruction(signer.pubkey(), uniquifier_memo),
+        ],
     ))
 }
 
@@ -448,6 +486,18 @@ fn build_transaction(
         &[signer],
         blockhash,
     ))
+}
+
+fn build_uniquifier_memo_instruction(signer: Address, memo: &str) -> Instruction {
+    spl_memo_interface::instruction::build_memo(
+        &spl_memo_interface::v3::id(),
+        memo.as_bytes(),
+        &[&signer],
+    )
+}
+
+fn slot_uniquifier_memo(target_slot: Slot, transaction_index: usize) -> String {
+    format!("slot:{target_slot}:tx:{transaction_index}")
 }
 
 #[derive(Clone, Copy, Debug)]

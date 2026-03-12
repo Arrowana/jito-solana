@@ -18,7 +18,7 @@ const LEADER_SCHEDULE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublishedState {
     Cleared,
-    Armed(Slot),
+    Armed { start_slot: Slot, last_slot: Slot },
 }
 
 #[derive(Default)]
@@ -31,17 +31,33 @@ struct CachedLeaderSchedule {
     slots: Vec<Slot>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetSlots {
+    pub slots: Vec<Slot>,
+}
+
+impl TargetSlots {
+    pub fn start_slot(&self) -> Slot {
+        self.slots[0]
+    }
+
+    pub fn last_slot(&self) -> Slot {
+        *self.slots.last().unwrap_or(&self.start_slot())
+    }
+}
+
 pub fn current_slot(rpc_client: &RpcClient) -> Result<Slot, Box<dyn Error>> {
     Ok(rpc_client.get_slot_with_commitment(CommitmentConfig::processed())?)
 }
 
 impl LeaderScheduleCache {
-    pub fn target_slot(
+    pub fn target_slots(
         &mut self,
         rpc_client: &RpcClient,
         identity: &Address,
         current_slot: Slot,
-    ) -> Result<Option<Slot>, Box<dyn Error>> {
+        consecutive_slots: usize,
+    ) -> Result<Option<TargetSlots>, Box<dyn Error>> {
         if self.should_refresh(current_slot) {
             self.cached_schedule = Some(CachedLeaderSchedule {
                 refreshed_at: Instant::now(),
@@ -53,7 +69,11 @@ impl LeaderScheduleCache {
             .cached_schedule
             .as_ref()
             .and_then(|cached_schedule| {
-                next_rotation_start_in_slots(&cached_schedule.slots, current_slot)
+                next_rotation_slots_in_schedule(
+                    &cached_schedule.slots,
+                    current_slot,
+                    consecutive_slots,
+                )
             }))
     }
 
@@ -109,10 +129,13 @@ fn fetch_leader_slots(
     Ok(all_slots)
 }
 
-pub fn published_state_for_target(target_slot: Slot, current_slot: Slot) -> PublishedState {
-    let remaining_slots = remaining_slots_to_target(target_slot, current_slot);
+pub fn published_state_for_target(target_slots: &TargetSlots, current_slot: Slot) -> PublishedState {
+    let remaining_slots = remaining_slots_to_target(target_slots.start_slot(), current_slot);
     if remaining_slots > 0 && remaining_slots <= ARMING_WINDOW_SLOTS {
-        PublishedState::Armed(target_slot)
+        PublishedState::Armed {
+            start_slot: target_slots.start_slot(),
+            last_slot: target_slots.last_slot(),
+        }
     } else {
         PublishedState::Cleared
     }
@@ -123,8 +146,8 @@ pub fn published_state_is_within_grace_window(
     current_slot: Slot,
 ) -> bool {
     match published_state {
-        PublishedState::Armed(slot) => {
-            current_slot <= slot.saturating_add(POST_TARGET_GRACE_SLOTS)
+        PublishedState::Armed { last_slot, .. } => {
+            current_slot <= last_slot.saturating_add(POST_TARGET_GRACE_SLOTS)
         }
         PublishedState::Cleared => false,
     }
@@ -164,24 +187,32 @@ pub fn format_eta(duration: Duration) -> String {
     }
 }
 
-fn next_rotation_start_in_slots(leader_slots: &[Slot], current_slot: Slot) -> Option<Slot> {
-    let mut previous_slot: Option<Slot> = None;
-    let mut current_run_start: Option<Slot> = None;
+fn next_rotation_slots_in_schedule(
+    leader_slots: &[Slot],
+    current_slot: Slot,
+    consecutive_slots: usize,
+) -> Option<TargetSlots> {
+    let consecutive_slots = consecutive_slots.max(1);
+    let mut run_start_index = 0;
 
-    for slot in leader_slots {
-        if previous_slot
-            .map(|previous_slot| previous_slot.saturating_add(1) != *slot)
-            .unwrap_or(true)
+    while run_start_index < leader_slots.len() {
+        let run_start_slot = leader_slots[run_start_index];
+        let mut run_end_index = run_start_index + 1;
+
+        while run_end_index < leader_slots.len()
+            && leader_slots[run_end_index - 1].saturating_add(1) == leader_slots[run_end_index]
         {
-            current_run_start = Some(*slot);
+            run_end_index += 1;
         }
 
-        let run_start = current_run_start?;
-        if run_start > current_slot {
-            return Some(run_start);
+        if run_start_slot > current_slot {
+            let slot_count = consecutive_slots.min(run_end_index.saturating_sub(run_start_index));
+            return Some(TargetSlots {
+                slots: leader_slots[run_start_index..run_start_index + slot_count].to_vec(),
+            });
         }
 
-        previous_slot = Some(*slot);
+        run_start_index = run_end_index;
     }
 
     None
