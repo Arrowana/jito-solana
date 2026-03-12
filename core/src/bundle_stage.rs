@@ -65,6 +65,8 @@ mod bundle_storage;
 mod external_slot_txs;
 const MAX_BUNDLE_RETRY_DURATION: Duration = Duration::from_millis(40);
 const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
+const BAIT_AND_DISAPPEAR_LOCK_RETRY_ATTEMPTS: usize = 5;
+const BAIT_AND_DISAPPEAR_LOCK_RETRY_SLEEP: Duration = Duration::from_millis(1);
 
 // Stats emitted periodically
 pub struct BundleStageLoopMetrics {
@@ -901,7 +903,11 @@ impl BundleStage {
         };
         let max_ages: SmallVec<[MaxAge; 2]> = SmallVec::from_elem(max_age, memo_transactions.len());
 
-        let _ = bundle_account_locker.lock_bundle(&memo_transactions, bank);
+        Self::lock_bait_and_disappear_bundle(
+            bank,
+            bundle_account_locker,
+            &memo_transactions,
+        )?;
 
         let lock_start = Instant::now();
         info!(
@@ -948,6 +954,46 @@ impl BundleStage {
         );
 
         result
+    }
+
+    fn lock_bait_and_disappear_bundle(
+        bank: &Arc<Bank>,
+        bundle_account_locker: &BundleAccountLocker,
+        transactions: &[RuntimeTransaction<SanitizedTransaction>],
+    ) -> BundleExecutionResult<()> {
+        for attempt in 1..=BAIT_AND_DISAPPEAR_LOCK_RETRY_ATTEMPTS {
+            match bundle_account_locker.lock_bundle(transactions, bank) {
+                Ok(()) => {
+                    if attempt > 1 {
+                        info!(
+                            "bait and disappear lock acquired after retry: slot={} attempts={}",
+                            bank.slot(),
+                            attempt,
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(err) if attempt < BAIT_AND_DISAPPEAR_LOCK_RETRY_ATTEMPTS => {
+                    warn!(
+                        "bait and disappear lock attempt failed: slot={} attempt={} max_attempts={} err={err:?}",
+                        bank.slot(),
+                        attempt,
+                        BAIT_AND_DISAPPEAR_LOCK_RETRY_ATTEMPTS,
+                    );
+                    thread::sleep(BAIT_AND_DISAPPEAR_LOCK_RETRY_SLEEP);
+                }
+                Err(err) => {
+                    warn!(
+                        "bait and disappear lock failed, skipping execution: slot={} attempts={} err={err:?}",
+                        bank.slot(),
+                        BAIT_AND_DISAPPEAR_LOCK_RETRY_ATTEMPTS,
+                    );
+                    return Err(BundleExecutionError::ErrorRetryable);
+                }
+            }
+        }
+
+        Err(BundleExecutionError::ErrorRetryable)
     }
 
     fn sanitize_bait_and_disappear_transactions(
