@@ -1,11 +1,15 @@
 use {
     crate::{
         error::BoxError,
+        raydium_cp_swap_constants::{
+            POOL_STATE_DISCRIMINATOR, RAYDIUM_AUTH_SEED, RAYDIUM_CP_SWAP_PROGRAM_ID,
+            SWAP_BASE_INPUT_DISCRIMINATOR, SWAP_BASE_OUTPUT_DISCRIMINATOR,
+        },
         slot_assert::build_assert_slot_instruction,
-        transactions::ResolvedRaydiumCpSwapArgs,
+        transactions::{ResolvedRaydiumCpSwapArgs, RoundTripSimulationSummary},
     },
     bytemuck::{Pod, Zeroable},
-    solana_address::{address, Address},
+    solana_address::Address,
     solana_clock::Slot,
     solana_commitment_config::CommitmentConfig,
     solana_hash::Hash,
@@ -30,12 +34,6 @@ use {
     tracing::info,
 };
 
-const RAYDIUM_CP_SWAP_PROGRAM_ID: Address = address!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
-const RAYDIUM_AUTH_SEED: &[u8] = b"vault_and_lp_mint_auth_seed";
-const POOL_STATE_DISCRIMINATOR: [u8; 8] = [0xf7, 0xed, 0xe3, 0xf5, 0xd7, 0xc3, 0xde, 0x46];
-const SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [0x8f, 0xbe, 0x5a, 0xda, 0xc4, 0x1e, 0x33, 0xde];
-const SWAP_BASE_OUTPUT_DISCRIMINATOR: [u8; 8] =
-    [0x37, 0xd9, 0x62, 0x56, 0xa3, 0x4a, 0xb4, 0xad];
 const POOL_STATE_RAW_LEN: usize = size_of::<PoolStateRaw>();
 
 #[repr(C, packed)]
@@ -83,6 +81,7 @@ pub(super) async fn prepare_transactions(
         &first_leg_uniquifier,
         target_slot,
         false,
+        true,
     )?;
     let first_leg_simulation =
         simulate_first_leg(rpc_client, &simulated_first_leg_transaction, &route.first_leg).await?;
@@ -131,6 +130,7 @@ pub(super) fn build_transactions(
             &first_leg_uniquifier,
             target_slot,
             include_slot_assert,
+            true,
         )?,
         build_swap_base_input_transaction(
             signer,
@@ -142,6 +142,7 @@ pub(super) fn build_transactions(
             &second_leg_uniquifier,
             target_slot,
             include_slot_assert,
+            false,
         )?,
     ])
 }
@@ -154,13 +155,13 @@ pub async fn run_startup_setup(
     let pool_info = RaydiumCpSwapPoolInfo::load(rpc_client, args.pool).await?;
     let route = pool_info.round_trip_route(signer.pubkey(), args.input_mint)?;
     let initialize_user_accounts_instructions =
-        build_initialize_user_token_account_instructions(rpc_client, signer.pubkey(), &route)
+        build_initialize_user_input_token_account_instructions(rpc_client, signer.pubkey(), &route)
             .await?;
 
     if initialize_user_accounts_instructions.is_empty() {
         info!(
             pool = %pool_info.pool,
-            "raydium startup setup found no missing user token accounts",
+            "raydium startup setup found no missing input token account",
         );
         return Ok(());
     }
@@ -294,7 +295,6 @@ impl RaydiumCpSwapPoolInfo {
 
         Ok(RoundTripRoute {
             user_input_token_account: first_leg.input_token_account,
-            user_output_token_account: first_leg.output_token_account,
             second_leg: first_leg.reversed(),
             first_leg,
         })
@@ -360,21 +360,18 @@ impl SwapLeg {
 #[derive(Clone, Copy, Debug)]
 struct RoundTripRoute {
     user_input_token_account: Address,
-    user_output_token_account: Address,
     first_leg: SwapLeg,
     second_leg: SwapLeg,
 }
 
-async fn build_initialize_user_token_account_instructions(
+async fn build_initialize_user_input_token_account_instructions(
     rpc_client: &RpcClient,
     payer: Address,
     route: &RoundTripRoute,
 ) -> Result<Vec<Instruction>, BoxError> {
-    let accounts = rpc_client.get_multiple_accounts(&[
-        route.user_input_token_account,
-        route.user_output_token_account,
-    ])
-    .await?;
+    let accounts = rpc_client
+        .get_multiple_accounts(&[route.user_input_token_account])
+        .await?;
     let mut instructions = Vec::new();
 
     if accounts[0].is_none() {
@@ -391,20 +388,6 @@ async fn build_initialize_user_token_account_instructions(
         ));
     }
 
-    if accounts[1].is_none() {
-        info!(
-            token_account = %route.user_output_token_account,
-            mint = %route.first_leg.output_mint,
-            "initializing missing output token account",
-        );
-        instructions.push(create_associated_token_account_idempotent(
-            &payer,
-            &payer,
-            &route.first_leg.output_mint,
-            &route.first_leg.output_token_program,
-        ));
-    }
-
     Ok(instructions)
 }
 
@@ -418,15 +401,22 @@ fn build_swap_base_output_transaction(
     uniquifier_memo: &str,
     target_slot: Slot,
     include_slot_assert: bool,
+    initialize_output_token_account: bool,
 ) -> Result<VersionedTransaction, BoxError> {
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SWAP_BASE_OUTPUT_DISCRIMINATOR);
     data.extend_from_slice(&max_input_amount.to_le_bytes());
     data.extend_from_slice(&exact_output_amount.to_le_bytes());
 
-    let mut instructions = Vec::with_capacity(3);
+    let mut instructions = Vec::with_capacity(4);
     if include_slot_assert {
         instructions.push(build_assert_slot_instruction(target_slot));
+    }
+    if initialize_output_token_account {
+        instructions.push(build_initialize_output_token_account_instruction(
+            signer.pubkey(),
+            leg,
+        ));
     }
     instructions.push(build_swap_instruction(signer.pubkey(), pool_info, leg, data)?);
     instructions.push(build_uniquifier_memo_instruction(
@@ -447,15 +437,22 @@ fn build_swap_base_input_transaction(
     uniquifier_memo: &str,
     target_slot: Slot,
     include_slot_assert: bool,
+    initialize_output_token_account: bool,
 ) -> Result<VersionedTransaction, BoxError> {
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SWAP_BASE_INPUT_DISCRIMINATOR);
     data.extend_from_slice(&exact_input_amount.to_le_bytes());
     data.extend_from_slice(&minimum_output_amount.to_le_bytes());
 
-    let mut instructions = Vec::with_capacity(3);
+    let mut instructions = Vec::with_capacity(4);
     if include_slot_assert {
         instructions.push(build_assert_slot_instruction(target_slot));
+    }
+    if initialize_output_token_account {
+        instructions.push(build_initialize_output_token_account_instruction(
+            signer.pubkey(),
+            leg,
+        ));
     }
     instructions.push(build_swap_instruction(signer.pubkey(), pool_info, leg, data)?);
     instructions.push(build_uniquifier_memo_instruction(
@@ -493,6 +490,15 @@ fn build_swap_instruction(
         ],
         data,
     })
+}
+
+fn build_initialize_output_token_account_instruction(payer: Address, leg: &SwapLeg) -> Instruction {
+    create_associated_token_account_idempotent(
+        &payer,
+        &payer,
+        &leg.output_mint,
+        &leg.output_token_program,
+    )
 }
 
 fn build_transaction(
@@ -574,7 +580,7 @@ async fn simulate_first_leg(
         .into_iter()
         .next()
         .ok_or_else(|| io::Error::other("missing simulation result for first raydium leg"))?;
-    let user_output_before = parse_token_amount(
+    let user_output_before = parse_token_amount_or_zero(
         transaction_result
             .pre_execution_accounts
             .as_ref()
@@ -674,6 +680,13 @@ fn parse_token_amount(ui_account: Option<&UiAccount>) -> Result<u64, BoxError> {
     })?))
 }
 
+fn parse_token_amount_or_zero(ui_account: Option<&UiAccount>) -> Result<u64, BoxError> {
+    match ui_account {
+        Some(ui_account) => parse_token_amount(Some(ui_account)),
+        None => Ok(0),
+    }
+}
+
 fn inflate_amount_by_five_percent(amount: u64) -> Result<u64, BoxError> {
     amount
         .checked_mul(105)
@@ -728,6 +741,24 @@ pub fn log_post_simulation(
     prepared: &PreparedRaydiumCpSwap,
     simulation_result: &RpcSimulateBundleResult,
 ) -> Result<(), BoxError> {
+    let summary = round_trip_simulation_summary(prepared, simulation_result)?;
+
+    info!(
+        pool = %prepared.pool_info.pool,
+        input_mint = %prepared.route.first_leg.input_mint,
+        input_spent = summary.input_spent,
+        returned_input_amount = summary.returned_input_amount,
+        bundle_input_delta = summary.bundle_input_delta,
+        "simulated raydium bundle input returned after unwinding intermediate output",
+    );
+
+    Ok(())
+}
+
+pub fn round_trip_simulation_summary(
+    prepared: &PreparedRaydiumCpSwap,
+    simulation_result: &RpcSimulateBundleResult,
+) -> Result<RoundTripSimulationSummary, BoxError> {
     let first_transaction = simulation_result
         .transaction_results
         .first()
@@ -739,6 +770,12 @@ pub fn log_post_simulation(
     let first_leg_input_before = parse_token_amount(
         first_transaction
             .pre_execution_accounts
+            .as_ref()
+            .and_then(|accounts| accounts.first()),
+    )?;
+    let first_leg_input_after = parse_token_amount(
+        first_transaction
+            .post_execution_accounts
             .as_ref()
             .and_then(|accounts| accounts.first()),
     )?;
@@ -762,16 +799,22 @@ pub fn log_post_simulation(
                 second_leg_input_before, second_leg_input_after
             ))
         })?;
+    let input_spent = first_leg_input_before
+        .checked_sub(first_leg_input_after)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "simulated first raydium leg increased input token account unexpectedly: before={} after={}",
+                first_leg_input_before, first_leg_input_after
+            ))
+        })?;
     let bundle_input_delta =
         i128::from(second_leg_input_after) - i128::from(first_leg_input_before);
 
-    info!(
-        pool = %prepared.pool_info.pool,
-        input_mint = %prepared.route.first_leg.input_mint,
+    let _ = prepared;
+
+    Ok(RoundTripSimulationSummary {
+        input_spent,
         returned_input_amount,
         bundle_input_delta,
-        "simulated raydium bundle input returned after unwinding intermediate output",
-    );
-
-    Ok(())
+    })
 }

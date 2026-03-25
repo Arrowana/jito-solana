@@ -23,6 +23,13 @@ pub(crate) enum PreparedTransactions {
     RaydiumCpSwap(raydium_cp_swap::PreparedRaydiumCpSwap),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoundTripSimulationSummary {
+    pub input_spent: u64,
+    pub returned_input_amount: u64,
+    pub bundle_input_delta: i128,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ResolvedTransactionMode {
     Memo,
@@ -45,6 +52,10 @@ pub(crate) fn resolve_transaction_modes(
             .map(|_| ResolvedTransactionMode::Memo)
             .collect()),
         TransactionMode::RaydiumCpSwap(args) => resolve_raydium_transaction_modes(args, slot_count),
+        TransactionMode::ScanRaydiumCpSwap(_)
+        | TransactionMode::ProvisionRaydiumCpSwapPool(_) => Err(
+            io::Error::other("scan-raydium-cp-swap is not a writable transaction mode").into(),
+        ),
     }
 }
 
@@ -163,5 +174,17 @@ pub fn log_post_simulation(
         PreparedTransactions::RaydiumCpSwap(prepared) => {
             raydium_cp_swap::log_post_simulation(prepared, simulation_result)
         }
+    }
+}
+
+pub fn round_trip_simulation_summary(
+    prepared_transactions: &PreparedTransactions,
+    simulation_result: &RpcSimulateBundleResult,
+) -> Result<Option<RoundTripSimulationSummary>, BoxError> {
+    match prepared_transactions {
+        PreparedTransactions::Memo => Ok(None),
+        PreparedTransactions::RaydiumCpSwap(prepared) => Ok(Some(
+            raydium_cp_swap::round_trip_simulation_summary(prepared, simulation_result)?,
+        )),
     }
 }

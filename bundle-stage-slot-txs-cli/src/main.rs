@@ -1,6 +1,9 @@
 mod cli;
 mod error;
 mod logging;
+mod provision;
+mod raydium_cp_swap_constants;
+mod scan;
 mod schedule;
 mod simulation;
 mod snapshot;
@@ -12,6 +15,8 @@ use {
     cli::Config,
     error::BoxError,
     logging::init_logging,
+    provision::provision_raydium_cp_swap_pool,
+    scan::scan_raydium_cp_swap_pools,
     schedule::{
         countdown_log_bucket, current_slot, estimated_time_to_target, format_eta,
         published_state_for_target, published_state_is_within_grace_window,
@@ -45,13 +50,64 @@ async fn main() -> Result<(), BoxError> {
     config.validate()?;
 
     let transaction_mode = config.selected_transaction_mode();
+    let rpc_client = Arc::new(RpcClient::new(config.rpc_url.clone()));
+    if let cli::TransactionMode::ScanRaydiumCpSwap(args) = &transaction_mode {
+        let signer = if args.simulate_top > 0 {
+            let keypair_path = config.require_keypair()?;
+            Some(read_keypair_file(keypair_path).map_err(|err| {
+                io::Error::other(format!(
+                    "failed to read keypair from {}: {err}",
+                    keypair_path,
+                ))
+            })?)
+        } else {
+            None
+        };
+        info!(
+            rpc_url = %config.rpc_url,
+            input_mint = %args.input_mint,
+            input_amount = args.input_amount,
+            token_allowlist_source = args.token_allowlist_source.label(),
+            min_estimated_tvl_usdc = args.min_estimated_tvl_usdc,
+            min_token_volume_24h_usd = args.min_token_volume_24h_usd,
+            allowed_trade_fee_rates = ?args.trade_fee_rates,
+            top = args.top,
+            simulate_top = args.simulate_top,
+            "starting raydium cp-swap pool scan",
+        );
+        scan_raydium_cp_swap_pools(rpc_client.as_ref(), args, signer.as_ref()).await?;
+        return Ok(());
+    }
+    if let cli::TransactionMode::ProvisionRaydiumCpSwapPool(args) = &transaction_mode {
+        let keypair_path = config.require_keypair()?;
+        let signer = read_keypair_file(keypair_path).map_err(|err| {
+            io::Error::other(format!(
+                "failed to read keypair from {}: {err}",
+                keypair_path,
+            ))
+        })?;
+        info!(
+            rpc_url = %config.rpc_url,
+            token_a_mint = %args.token_a_mint,
+            token_b_mint = %args.token_b_mint,
+            total_tvl_usdc = args.total_tvl_usdc,
+            chunk_tvl_usdc = args.chunk_tvl_usdc,
+            max_existing_tvl_usdc = args.max_existing_tvl_usdc,
+            max_price_deviation_bps = args.max_price_deviation_bps,
+            "starting raydium cp-swap pool provisioning",
+        );
+        provision_raydium_cp_swap_pool(rpc_client.as_ref(), &signer, args).await?;
+        return Ok(());
+    }
+
     let configured_transaction_modes =
         resolve_transaction_modes(&transaction_mode, usize::from(config.consecutive_slots))?;
-    let rpc_client = Arc::new(RpcClient::new(config.rpc_url.clone()));
-    let signer = Arc::new(read_keypair_file(&config.keypair).map_err(|err| {
+    let identity = config.require_identity()?;
+    let keypair_path = config.require_keypair()?;
+    let signer = Arc::new(read_keypair_file(keypair_path).map_err(|err| {
         io::Error::other(format!(
             "failed to read keypair from {}: {err}",
-            config.keypair,
+            keypair_path,
         ))
     })?);
     let mut published_state = PublishedState::Cleared;
@@ -61,7 +117,7 @@ async fn main() -> Result<(), BoxError> {
 
     clear_snapshot_file(config.gap_duration_millis)?;
     info!(
-        identity = %config.identity,
+        identity = %identity,
         rpc_url = %config.rpc_url,
         snapshot_path = BAIT_AND_DISAPPEAR_TXS_PATH,
         gap_duration_millis = config.gap_duration_millis,
@@ -89,7 +145,7 @@ async fn main() -> Result<(), BoxError> {
         let target_slots = match leader_schedule_cache
             .target_slots(
                 rpc_client.as_ref(),
-                &config.identity,
+                &identity,
                 current_slot,
                 usize::from(config.consecutive_slots),
             )
@@ -99,7 +155,7 @@ async fn main() -> Result<(), BoxError> {
             Ok(None) => {
                 panic!(
                     "no upcoming leader slot found for configured identity {} at current_slot={}",
-                    config.identity, current_slot
+                    identity, current_slot
                 );
             }
             Err(err) => {
