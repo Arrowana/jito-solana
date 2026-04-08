@@ -13,6 +13,7 @@ mod transactions;
 use {
     clap::Parser,
     cli::Config,
+    dotenvy::from_path_override,
     error::BoxError,
     logging::init_logging,
     provision::provision_raydium_cp_swap_pool,
@@ -31,7 +32,7 @@ use {
     solana_hash::Hash,
     solana_keypair::{read_keypair_file, Keypair},
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
-    std::{io, sync::Arc, time::Duration},
+    std::{io, path::PathBuf, sync::Arc, time::Duration},
     tokio::{task::JoinSet, time::sleep},
     tracing::{error, info},
     transactions::{
@@ -44,6 +45,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1_000);
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), BoxError> {
+    load_dotenv();
     init_logging();
 
     let config = Config::parse();
@@ -80,6 +82,7 @@ async fn main() -> Result<(), BoxError> {
     }
     if let cli::TransactionMode::ProvisionRaydiumCpSwapPool(args) = &transaction_mode {
         let keypair_path = config.require_keypair()?;
+        let jup_api_key = config.jup_api_key();
         let signer = read_keypair_file(keypair_path).map_err(|err| {
             io::Error::other(format!(
                 "failed to read keypair from {}: {err}",
@@ -94,9 +97,13 @@ async fn main() -> Result<(), BoxError> {
             chunk_tvl_usdc = args.chunk_tvl_usdc,
             max_existing_tvl_usdc = args.max_existing_tvl_usdc,
             max_price_deviation_bps = args.max_price_deviation_bps,
+            max_jupiter_price_impact_bps = args.max_jupiter_price_impact_bps,
+            jupiter_slippage_bps = args.jupiter_slippage_bps,
+            using_jup_api_key = jup_api_key.is_some(),
             "starting raydium cp-swap pool provisioning",
         );
-        provision_raydium_cp_swap_pool(rpc_client.as_ref(), &signer, args).await?;
+        provision_raydium_cp_swap_pool(rpc_client.as_ref(), &signer, args, jup_api_key.as_deref())
+            .await?;
         return Ok(());
     }
 
@@ -273,6 +280,16 @@ async fn main() -> Result<(), BoxError> {
         }
 
         sleep(POLL_INTERVAL).await;
+    }
+}
+
+fn load_dotenv() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for path in [manifest_dir.join(".env"), PathBuf::from(".env")] {
+        if path.is_file() {
+            let _ = from_path_override(path);
+            break;
+        }
     }
 }
 

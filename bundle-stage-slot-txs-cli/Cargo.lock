@@ -634,12 +634,15 @@ checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 name = "bundle-stage-slot-txs-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bincode",
  "bytemuck",
  "clap",
  "csv",
+ "dotenvy",
  "reqwest",
  "serde",
+ "serde_json",
  "solana-account",
  "solana-address 1.1.0",
  "solana-bn254",
@@ -654,6 +657,7 @@ dependencies = [
  "solana-rpc-client-api",
  "solana-signature",
  "solana-signer",
+ "solana-system-interface",
  "solana-transaction",
  "spl-associated-token-account-interface",
  "spl-memo-interface",
@@ -1039,6 +1043,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "eager"

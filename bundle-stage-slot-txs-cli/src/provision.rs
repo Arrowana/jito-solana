@@ -9,8 +9,12 @@ use {
             RAYDIUM_POOL_LP_MINT_SEED, RAYDIUM_POOL_SEED, RAYDIUM_POOL_VAULT_SEED,
         },
     },
+    base64::{prelude::BASE64_STANDARD, Engine},
     bytemuck::{Pod, Zeroable},
     csv::ReaderBuilder,
+    reqwest::Client,
+    serde::{Deserialize, Serialize},
+    serde_json::Value,
     solana_account::Account,
     solana_address::{address, Address},
     solana_commitment_config::CommitmentConfig,
@@ -23,18 +27,21 @@ use {
         response::UiAccountEncoding,
     },
     solana_signer::Signer,
-    solana_transaction::Transaction,
+    solana_system_interface::instruction::transfer as system_transfer,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
     spl_associated_token_account_interface::{
         address::get_associated_token_address_with_program_id,
         instruction::create_associated_token_account_idempotent,
     },
-    std::{collections::HashMap, io, mem::size_of, path::PathBuf},
+    std::{collections::HashMap, io, mem::size_of, path::PathBuf, time::Duration},
     tracing::info,
 };
 
 const SYSTEM_PROGRAM_ID: Address = address!("11111111111111111111111111111111");
 const RENT_SYSVAR_ID: Address = address!("SysvarRent111111111111111111111111111111111");
 const JUPITER_VERIFIED_TOKENS_CSV: &str = "jupiter_verified_tokens.csv";
+const JUPITER_SWAP_API_BASE_URL: &str = "https://api.jup.ag/swap/v1";
+const JUPITER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
 const USD_EPSILON: f64 = 1e-9;
 
@@ -137,11 +144,50 @@ struct SelectedPool {
     existing_snapshot: Option<PoolSnapshot>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JupiterQuoteResponse {
+    input_mint: String,
+    in_amount: String,
+    output_mint: String,
+    out_amount: String,
+    other_amount_threshold: String,
+    swap_mode: String,
+    slippage_bps: u64,
+    price_impact_pct: String,
+    route_plan: Vec<Value>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JupiterSwapRequest<'a> {
+    user_public_key: String,
+    quote_response: &'a JupiterQuoteResponse,
+    wrap_and_unwrap_sol: bool,
+    dynamic_compute_unit_limit: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JupiterSwapResponse {
+    swap_transaction: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChunkFunding {
+    token_0_amount: u64,
+    token_1_amount: u64,
+}
+
 pub async fn provision_raydium_cp_swap_pool(
     rpc_client: &RpcClient,
     signer: &Keypair,
     args: &ProvisionRaydiumCpSwapPoolArgs,
+    jup_api_key: Option<&str>,
 ) -> Result<(), BoxError> {
+    let http_client = Client::builder().timeout(JUPITER_HTTP_TIMEOUT).build()?;
     let price_map = load_jupiter_price_map()?;
     let (token_0_mint, token_1_mint, token_0_override, token_1_override) =
         if args.token_a_mint < args.token_b_mint {
@@ -163,9 +209,25 @@ pub async fn provision_raydium_cp_swap_pool(
     let token_0 = load_mint_metadata(rpc_client, token_0_mint, token_0_override, &price_map).await?;
     let token_1 = load_mint_metadata(rpc_client, token_1_mint, token_1_override, &price_map).await?;
     let amm_configs = fetch_amm_configs(rpc_client).await?;
+    let selected_amm_configs = if let Some(amm_config) = args.amm_config {
+        vec![
+            amm_configs
+                .iter()
+                .copied()
+                .find(|config| config.address == amm_config)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "amm config {} is not a supported enabled 0.25% Raydium cp-swap config",
+                        amm_config
+                    ))
+                })?,
+        ]
+    } else {
+        amm_configs
+    };
     let selected_pool = select_pool_for_pair(
         rpc_client,
-        &amm_configs,
+        &selected_amm_configs,
         &token_0,
         &token_1,
         args.max_existing_tvl_usdc,
@@ -180,6 +242,7 @@ pub async fn provision_raydium_cp_swap_pool(
         token_1_mint = %token_1.mint,
         token_1_symbol = token_1.symbol,
         token_1_price = token_1.usd_price,
+        requested_config = ?args.amm_config,
         selected_config = %selected_pool.config.address,
         selected_config_index = selected_pool.config.index,
         selected_pool = %selected_pool.addresses.pool,
@@ -191,14 +254,73 @@ pub async fn provision_raydium_cp_swap_pool(
     let mut remaining_tvl_usdc = args.total_tvl_usdc;
     let mut chunk_index = 0usize;
     let mut current_snapshot = selected_pool.existing_snapshot;
+    let use_jupiter_funding = token_0.mint
+        == Address::from(spl_token_interface::native_mint::id().to_bytes())
+        || token_1.mint == Address::from(spl_token_interface::native_mint::id().to_bytes());
+
+    if use_jupiter_funding && jup_api_key.is_none() {
+        return Err(io::Error::other(
+            "provisioning a WSOL pair requires Jupiter funding, but no JUP_API_KEY/--jup-api-key was provided",
+        )
+        .into());
+    }
 
     while remaining_tvl_usdc > USD_EPSILON {
         let chunk_tvl_usdc = remaining_tvl_usdc.min(args.chunk_tvl_usdc);
-        let desired_token_0_amount =
-            usd_to_raw_amount(chunk_tvl_usdc / 2.0, token_0.usd_price, token_0.decimals)?;
-        let desired_token_1_amount =
-            usd_to_raw_amount(chunk_tvl_usdc / 2.0, token_1.usd_price, token_1.decimals)?;
-        let blockhash = rpc_client.get_latest_blockhash().await?;
+        if let Some(snapshot) = current_snapshot {
+            validate_pool_price(snapshot, &token_0, &token_1, args.max_price_deviation_bps)?;
+        }
+
+        let desired_chunk_funding = ChunkFunding {
+            token_0_amount: usd_to_raw_amount(
+                chunk_tvl_usdc / 2.0,
+                token_0.usd_price,
+                token_0.decimals,
+            )?,
+            token_1_amount: usd_to_raw_amount(
+                chunk_tvl_usdc / 2.0,
+                token_1.usd_price,
+                token_1.decimals,
+            )?,
+        };
+
+        let ChunkFunding {
+            token_0_amount: desired_token_0_amount,
+            token_1_amount: desired_token_1_amount,
+        } = if use_jupiter_funding {
+            let signer_balances =
+                load_signer_token_balances(rpc_client, signer.pubkey(), &token_0, &token_1).await?;
+            if signer_balances.token_0_amount >= desired_chunk_funding.token_0_amount
+                && signer_balances.token_1_amount >= desired_chunk_funding.token_1_amount
+            {
+                info!(
+                    chunk_index = chunk_index + 1,
+                    chunk_tvl_usdc,
+                    token_0_symbol = token_0.symbol,
+                    token_0_available = signer_balances.token_0_amount,
+                    token_0_required = desired_chunk_funding.token_0_amount,
+                    token_1_symbol = token_1.symbol,
+                    token_1_available = signer_balances.token_1_amount,
+                    token_1_required = desired_chunk_funding.token_1_amount,
+                    "using existing wallet balances for provisioning chunk",
+                );
+                desired_chunk_funding
+            } else {
+                fund_chunk_with_jupiter(
+                    &http_client,
+                    rpc_client,
+                    signer,
+                    args,
+                    &token_0,
+                    &token_1,
+                    chunk_tvl_usdc,
+                    jup_api_key.expect("checked above"),
+                )
+                .await?
+            }
+        } else {
+            desired_chunk_funding
+        };
 
         if desired_token_0_amount == 0 || desired_token_1_amount == 0 {
             return Err(io::Error::other(format!(
@@ -209,12 +331,12 @@ pub async fn provision_raydium_cp_swap_pool(
         }
 
         let signature = if let Some(snapshot) = current_snapshot {
-            validate_pool_price(snapshot, &token_0, &token_1, args.max_price_deviation_bps)?;
             let lp_token_amount =
                 quote_lp_token_amount(snapshot, desired_token_0_amount, desired_token_1_amount)?;
             let maximum_token_0_amount = inflate_amount_by_five_percent(desired_token_0_amount)?;
             let maximum_token_1_amount = inflate_amount_by_five_percent(desired_token_1_amount)?;
-            let spl_token_program_id = spl_token_program_id();
+            let spl_token_program_id = Address::from(spl_token_interface::id().to_bytes());
+            let blockhash = rpc_client.get_latest_blockhash().await?;
             let owner_lp_token =
                 get_associated_token_address_with_program_id(
                     &signer.pubkey(),
@@ -290,8 +412,9 @@ pub async fn provision_raydium_cp_swap_pool(
             let creator_lp_token = get_associated_token_address_with_program_id(
                 &signer.pubkey(),
                 &selected_pool.addresses.lp_mint,
-                &spl_token_program_id(),
+                &Address::from(spl_token_interface::id().to_bytes()),
             );
+            let blockhash = rpc_client.get_latest_blockhash().await?;
             let mut instructions = vec![
                 create_associated_token_account_idempotent(
                     &signer.pubkey(),
@@ -544,6 +667,316 @@ async fn select_pool_for_pair(
     })
 }
 
+async fn fund_chunk_with_jupiter(
+    http_client: &Client,
+    rpc_client: &RpcClient,
+    signer: &Keypair,
+    args: &ProvisionRaydiumCpSwapPoolArgs,
+    token_0: &MintMetadata,
+    token_1: &MintMetadata,
+    chunk_tvl_usdc: f64,
+    jup_api_key: &str,
+) -> Result<ChunkFunding, BoxError> {
+    let wsol_mint = Address::from(spl_token_interface::native_mint::id().to_bytes());
+    let (target_token, wsol_is_token_0) = if token_0.mint == wsol_mint {
+        (token_1, true)
+    } else if token_1.mint == wsol_mint {
+        (token_0, false)
+    } else {
+        return Err(io::Error::other(
+            "Jupiter-funded provisioning currently only supports WSOL/token pools",
+        )
+        .into());
+    };
+
+    let sol_half_chunk_amount = usd_to_raw_amount(
+        chunk_tvl_usdc / 2.0,
+        if wsol_is_token_0 {
+            token_0.usd_price
+        } else {
+            token_1.usd_price
+        },
+        spl_token_interface::native_mint::DECIMALS,
+    )?;
+    if sol_half_chunk_amount == 0 {
+        return Err(io::Error::other("computed zero SOL amount for Jupiter-funded chunk").into());
+    }
+
+    let required_wsol_amount = sol_half_chunk_amount
+        .checked_mul(2)
+        .ok_or_else(|| io::Error::other("required WSOL amount overflowed"))?;
+    let signer_wsol_account = get_associated_token_address_with_program_id(
+        &signer.pubkey(),
+        &wsol_mint,
+        &Address::from(spl_token_interface::id().to_bytes()),
+    );
+    let pre_funding_wsol_amount =
+        get_optional_token_account_amount(rpc_client, signer_wsol_account).await?;
+    let wsol_top_up_amount = required_wsol_amount.saturating_sub(pre_funding_wsol_amount);
+    if wsol_top_up_amount > 0 {
+        wrap_sol_into_wsol_account(rpc_client, signer, wsol_top_up_amount).await?;
+    }
+
+    let target_token_account = get_associated_token_address_with_program_id(
+        &signer.pubkey(),
+        &target_token.mint,
+        &target_token.token_program,
+    );
+    let pre_swap_target_amount =
+        get_optional_token_account_amount(rpc_client, target_token_account).await?;
+    let quote = fetch_jupiter_quote(
+        http_client,
+        jup_api_key,
+        wsol_mint,
+        target_token.mint,
+        sol_half_chunk_amount,
+        args.jupiter_slippage_bps,
+    )
+    .await?;
+    let price_impact_bps = parse_jupiter_price_impact_bps(&quote.price_impact_pct)?;
+    if price_impact_bps > args.max_jupiter_price_impact_bps {
+        return Err(io::Error::other(format!(
+            "jupiter quote price impact {} bps exceeds configured limit {} bps for target mint {}",
+            price_impact_bps, args.max_jupiter_price_impact_bps, target_token.mint
+        ))
+        .into());
+    }
+
+    info!(
+        target_mint = %target_token.mint,
+        target_symbol = target_token.symbol,
+        chunk_tvl_usdc,
+        sol_swap_input_lamports = sol_half_chunk_amount,
+        quoted_output_amount = quote.out_amount,
+        price_impact_bps,
+        "accepted Jupiter quote for provisioning chunk",
+    );
+
+    let swap_transaction = build_signed_jupiter_swap_transaction(
+        http_client,
+        jup_api_key,
+        signer,
+        &quote,
+    )
+    .await?;
+    let swap_signature = rpc_client.send_and_confirm_transaction(&swap_transaction).await?;
+    let post_swap_target_amount =
+        get_optional_token_account_amount(rpc_client, target_token_account).await?;
+    let acquired_target_amount = post_swap_target_amount.saturating_sub(pre_swap_target_amount);
+    if acquired_target_amount == 0 {
+        return Err(io::Error::other(format!(
+            "jupiter swap {} produced no received tokens for mint {}",
+            swap_signature, target_token.mint
+        ))
+        .into());
+    }
+
+    let post_swap_wsol_amount =
+        get_optional_token_account_amount(rpc_client, signer_wsol_account).await?;
+    if post_swap_wsol_amount < sol_half_chunk_amount {
+        return Err(io::Error::other(format!(
+            "jupiter swap {} left insufficient WSOL for deposit: have {} need {}",
+            swap_signature, post_swap_wsol_amount, sol_half_chunk_amount
+        ))
+        .into());
+    }
+    info!(
+        target_mint = %target_token.mint,
+        target_symbol = target_token.symbol,
+        swap_signature = %swap_signature,
+        acquired_target_amount,
+        wsol_top_up_amount,
+        remaining_wsol_amount = post_swap_wsol_amount,
+        "funded provisioning chunk via Jupiter swap and retained WSOL",
+    );
+
+    Ok(if wsol_is_token_0 {
+        ChunkFunding {
+            token_0_amount: sol_half_chunk_amount,
+            token_1_amount: acquired_target_amount,
+        }
+    } else {
+        ChunkFunding {
+            token_0_amount: acquired_target_amount,
+            token_1_amount: sol_half_chunk_amount,
+        }
+    })
+}
+
+async fn fetch_jupiter_quote(
+    http_client: &Client,
+    jup_api_key: &str,
+    input_mint: Address,
+    output_mint: Address,
+    amount: u64,
+    slippage_bps: u64,
+) -> Result<JupiterQuoteResponse, BoxError> {
+    let response = http_client
+        .get(format!("{JUPITER_SWAP_API_BASE_URL}/quote"))
+        .header("x-api-key", jup_api_key)
+        .query(&[
+            ("inputMint", input_mint.to_string()),
+            ("outputMint", output_mint.to_string()),
+            ("amount", amount.to_string()),
+            ("slippageBps", slippage_bps.to_string()),
+            ("swapMode", "ExactIn".to_string()),
+        ])
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "jupiter quote request failed with status {}: {}",
+            status, body
+        ))
+        .into());
+    }
+    serde_json::from_str(&body).map_err(|err| {
+        io::Error::other(format!("failed to decode jupiter quote response: {err}; body={body}"))
+            .into()
+    })
+}
+
+async fn build_signed_jupiter_swap_transaction(
+    http_client: &Client,
+    jup_api_key: &str,
+    signer: &Keypair,
+    quote: &JupiterQuoteResponse,
+) -> Result<VersionedTransaction, BoxError> {
+    let response = http_client
+        .post(format!("{JUPITER_SWAP_API_BASE_URL}/swap"))
+        .header("x-api-key", jup_api_key)
+        .json(&JupiterSwapRequest {
+            user_public_key: signer.pubkey().to_string(),
+            quote_response: quote,
+            wrap_and_unwrap_sol: false,
+            dynamic_compute_unit_limit: true,
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "jupiter swap build request failed with status {}: {}",
+            status, body
+        ))
+        .into());
+    }
+
+    let swap_response: JupiterSwapResponse = serde_json::from_str(&body).map_err(|err| {
+        io::Error::other(format!(
+            "failed to decode jupiter swap response: {err}; body={body}"
+        ))
+    })?;
+    let serialized_transaction = BASE64_STANDARD
+        .decode(swap_response.swap_transaction)
+        .map_err(|err| io::Error::other(format!("failed to decode jupiter swap base64: {err}")))?;
+    let unsigned_transaction: VersionedTransaction = bincode::deserialize(&serialized_transaction)
+        .map_err(|err| io::Error::other(format!(
+            "failed to deserialize jupiter swap transaction: {err}"
+        )))?;
+
+    VersionedTransaction::try_new(unsigned_transaction.message, &[signer]).map_err(|err| {
+        io::Error::other(format!(
+            "failed to sign Jupiter swap transaction for {}: {err}",
+            signer.pubkey()
+        ))
+        .into()
+    })
+}
+
+async fn wrap_sol_into_wsol_account(
+    rpc_client: &RpcClient,
+    signer: &Keypair,
+    lamports: u64,
+) -> Result<u64, BoxError> {
+    let spl_token_program_id = Address::from(spl_token_interface::id().to_bytes());
+    let wsol_mint = Address::from(spl_token_interface::native_mint::id().to_bytes());
+    let wsol_account = get_associated_token_address_with_program_id(
+        &signer.pubkey(),
+        &wsol_mint,
+        &spl_token_program_id,
+    );
+    let blockhash = rpc_client.get_latest_blockhash().await?;
+    let sync_native_instruction = spl_token_interface::instruction::sync_native(
+        &spl_token_interface::id(),
+        &wsol_account,
+    )
+    .map_err(|err| io::Error::other(format!("failed to build sync_native instruction: {err}")))?;
+    let instructions = vec![
+        create_associated_token_account_idempotent(
+            &signer.pubkey(),
+            &signer.pubkey(),
+            &wsol_mint,
+            &spl_token_program_id,
+        ),
+        system_transfer(&signer.pubkey(), &wsol_account, lamports),
+        sync_native_instruction,
+    ];
+    let transaction = build_signed_transaction(signer, blockhash, &instructions);
+    let signature = rpc_client.send_and_confirm_transaction(&transaction).await?;
+    info!(
+        wsol_account = %wsol_account,
+        lamports,
+        signature = %signature,
+        "wrapped SOL into WSOL account for provisioning chunk",
+    );
+    Ok(lamports)
+}
+
+async fn get_optional_token_account_amount(
+    rpc_client: &RpcClient,
+    token_account: Address,
+) -> Result<u64, BoxError> {
+    let account = rpc_client
+        .get_account_with_commitment(&token_account, CommitmentConfig::processed())
+        .await?
+        .value;
+    account
+        .as_ref()
+        .map(parse_token_account_amount)
+        .transpose()
+        .map(|amount| amount.unwrap_or(0))
+}
+
+async fn load_signer_token_balances(
+    rpc_client: &RpcClient,
+    signer: Address,
+    token_0: &MintMetadata,
+    token_1: &MintMetadata,
+) -> Result<ChunkFunding, BoxError> {
+    let token_0_account = get_associated_token_address_with_program_id(
+        &signer,
+        &token_0.mint,
+        &token_0.token_program,
+    );
+    let token_1_account = get_associated_token_address_with_program_id(
+        &signer,
+        &token_1.mint,
+        &token_1.token_program,
+    );
+
+    Ok(ChunkFunding {
+        token_0_amount: get_optional_token_account_amount(rpc_client, token_0_account).await?,
+        token_1_amount: get_optional_token_account_amount(rpc_client, token_1_account).await?,
+    })
+}
+
+fn parse_jupiter_price_impact_bps(price_impact_pct: &str) -> Result<u64, BoxError> {
+    let price_impact_pct = price_impact_pct.parse::<f64>().map_err(|err| {
+        io::Error::other(format!(
+            "failed to parse Jupiter priceImpactPct '{}': {err}",
+            price_impact_pct
+        ))
+    })?;
+    if !price_impact_pct.is_finite() || price_impact_pct < 0.0 {
+        return Err(io::Error::other("Jupiter price impact must be a finite non-negative value").into());
+    }
+    Ok((price_impact_pct * 10_000.0).round() as u64)
+}
+
 fn derive_pool_addresses(
     amm_config: Address,
     token_0_mint: Address,
@@ -708,7 +1141,7 @@ fn build_initialize_instruction(
     init_token_0_amount: u64,
     init_token_1_amount: u64,
 ) -> Instruction {
-    let spl_token_program_id = spl_token_program_id();
+    let spl_token_program_id = Address::from(spl_token_interface::id().to_bytes());
     let mut data = Vec::with_capacity(32);
     data.extend_from_slice(&INITIALIZE_DISCRIMINATOR);
     data.extend_from_slice(&init_token_0_amount.to_le_bytes());
@@ -735,7 +1168,12 @@ fn build_initialize_instruction(
             AccountMeta::new_readonly(spl_token_program_id, false),
             AccountMeta::new_readonly(token_0.token_program, false),
             AccountMeta::new_readonly(token_1.token_program, false),
-            AccountMeta::new_readonly(associated_token_program_id(), false),
+            AccountMeta::new_readonly(
+                Address::from(
+                    spl_associated_token_account_interface::program::id().to_bytes(),
+                ),
+                false,
+            ),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
             AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
         ],
@@ -755,8 +1193,9 @@ fn build_deposit_instruction(
     maximum_token_0_amount: u64,
     maximum_token_1_amount: u64,
 ) -> Instruction {
-    let spl_token_program_id = spl_token_program_id();
-    let spl_token_2022_program_id = spl_token_2022_program_id();
+    let spl_token_program_id = Address::from(spl_token_interface::id().to_bytes());
+    let spl_token_2022_program_id =
+        Address::from(spl_token_2022_interface::id().to_bytes());
     let mut data = Vec::with_capacity(32);
     data.extend_from_slice(&DEPOSIT_DISCRIMINATOR);
     data.extend_from_slice(&lp_token_amount.to_le_bytes());
@@ -782,18 +1221,6 @@ fn build_deposit_instruction(
         ],
         data,
     }
-}
-
-fn spl_token_program_id() -> Address {
-    Address::from(spl_token_interface::id().to_bytes())
-}
-
-fn spl_token_2022_program_id() -> Address {
-    Address::from(spl_token_2022_interface::id().to_bytes())
-}
-
-fn associated_token_program_id() -> Address {
-    Address::from(spl_associated_token_account_interface::program::id().to_bytes())
 }
 
 fn build_signed_transaction(
