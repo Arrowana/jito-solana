@@ -16,6 +16,9 @@ pub struct Config {
     #[arg(long)]
     pub keypair: Option<String>,
 
+    #[arg(long, env = "JUP_API_KEY")]
+    pub jup_api_key: Option<String>,
+
     #[arg(long, default_value_t = 10)]
     pub gap_duration_millis: u64,
 
@@ -78,6 +81,12 @@ impl Config {
         self.keypair.as_deref().ok_or_else(|| {
             io::Error::other("--keypair is required for memo and raydium-cp-swap modes")
         })
+    }
+
+    pub fn jup_api_key(&self) -> Option<String> {
+        self.jup_api_key
+            .clone()
+            .or_else(|| std::env::var("JUPITER_API_KEY").ok())
     }
 }
 
@@ -173,6 +182,9 @@ pub struct ProvisionRaydiumCpSwapPoolArgs {
     pub token_b_mint: Address,
 
     #[arg(long)]
+    pub amm_config: Option<Address>,
+
+    #[arg(long)]
     pub token_a_usd_price: Option<f64>,
 
     #[arg(long)]
@@ -189,6 +201,12 @@ pub struct ProvisionRaydiumCpSwapPoolArgs {
 
     #[arg(long, default_value_t = 500)]
     pub max_price_deviation_bps: u64,
+
+    #[arg(long, default_value_t = 500)]
+    pub max_jupiter_price_impact_bps: u64,
+
+    #[arg(long, default_value_t = 100)]
+    pub jupiter_slippage_bps: u64,
 }
 
 impl ProvisionRaydiumCpSwapPoolArgs {
@@ -206,6 +224,9 @@ impl ProvisionRaydiumCpSwapPoolArgs {
             return Err(io::Error::other(
                 "--max-existing-tvl-usdc must be a non-negative finite number",
             ));
+        }
+        if self.jupiter_slippage_bps == 0 {
+            return Err(io::Error::other("--jupiter-slippage-bps must be greater than 0"));
         }
         for (label, maybe_price) in [
             ("token-a-usd-price", self.token_a_usd_price),
