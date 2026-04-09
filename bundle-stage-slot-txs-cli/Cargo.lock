@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "agave-feature-set"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "ahash",
  "solana-epoch-schedule",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "agave-syscalls"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "bincode",
  "libsecp256k1",
@@ -80,7 +80,7 @@ dependencies = [
  "solana-bn254",
  "solana-clock",
  "solana-cpi",
- "solana-curve25519 3.1.10",
+ "solana-curve25519 3.1.12",
  "solana-hash 3.1.0",
  "solana-instruction",
  "solana-keccak-hasher",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "solana-account-decoder"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "Inflector",
  "base64 0.22.1",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "solana-account-decoder-client-types"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -3054,7 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bpf-loader-program"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "agave-syscalls",
  "bincode",
@@ -3136,6 +3136,8 @@ dependencies = [
 [[package]]
 name = "solana-curve25519"
 version = "3.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3d7e1177e6006823b91e0a930d94992ed74f8a6327d54ee50a9457ff72e625a"
 dependencies = [
  "bytemuck",
  "bytemuck_derive",
@@ -3147,9 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "solana-curve25519"
-version = "3.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3d7e1177e6006823b91e0a930d94992ed74f8a6327d54ee50a9457ff72e625a"
+version = "3.1.12"
 dependencies = [
  "bytemuck",
  "bytemuck_derive",
@@ -3402,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "solana-loader-v4-program"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "log",
  "solana-account",
@@ -3487,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "solana-poseidon"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "ark-bn254 0.4.0",
  "ark-bn254 0.5.0",
@@ -3553,7 +3553,7 @@ dependencies = [
 
 [[package]]
 name = "solana-program-runtime"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -3637,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rpc-client"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3674,7 +3674,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rpc-client-api"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "anyhow",
  "jsonrpc-core",
@@ -3696,7 +3696,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rpc-client-types"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -3916,7 +3916,7 @@ dependencies = [
 
 [[package]]
 name = "solana-svm"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "ahash",
  "log",
@@ -3957,7 +3957,7 @@ dependencies = [
 
 [[package]]
 name = "solana-svm-callback"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "solana-account",
  "solana-clock",
@@ -3967,22 +3967,22 @@ dependencies = [
 
 [[package]]
 name = "solana-svm-feature-set"
-version = "3.1.10"
+version = "3.1.12"
 
 [[package]]
 name = "solana-svm-log-collector"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "solana-svm-measure"
-version = "3.1.10"
+version = "3.1.12"
 
 [[package]]
 name = "solana-svm-timings"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "eager",
  "enum-iterator",
@@ -3991,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "solana-svm-transaction"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "solana-hash 3.1.0",
  "solana-message",
@@ -4003,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "solana-svm-type-overrides"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "rand 0.8.5",
 ]
@@ -4089,7 +4089,7 @@ dependencies = [
 
 [[package]]
 name = "solana-transaction-context"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "bincode",
  "serde",
@@ -4116,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "solana-transaction-status-client-types"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -4138,7 +4138,7 @@ dependencies = [
 
 [[package]]
 name = "solana-version"
-version = "3.1.10"
+version = "3.1.12"
 dependencies = [
  "agave-feature-set",
  "rand 0.8.5",
@@ -4342,7 +4342,7 @@ checksum = "879a9ebad0d77383d3ea71e7de50503554961ff0f4ef6cbca39ad126e6f6da3a"
 dependencies = [
  "bytemuck",
  "solana-account-info",
- "solana-curve25519 3.1.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "solana-curve25519 3.1.10",
  "solana-instruction",
  "solana-instructions-sysvar",
  "solana-msg",
