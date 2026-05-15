@@ -115,6 +115,7 @@ struct MintMetadata {
 struct AmmConfigInfo {
     address: Address,
     index: u16,
+    trade_fee_rate: u64,
     create_pool_fee: u64,
 }
 
@@ -217,13 +218,16 @@ pub async fn provision_raydium_cp_swap_pool(
                 .find(|config| config.address == amm_config)
                 .ok_or_else(|| {
                     io::Error::other(format!(
-                        "amm config {} is not a supported enabled 0.25% Raydium cp-swap config",
+                        "amm config {} is not an enabled Raydium cp-swap config",
                         amm_config
                     ))
                 })?,
         ]
     } else {
         amm_configs
+            .into_iter()
+            .filter(|config| config.trade_fee_rate == 2_500)
+            .collect()
     };
     let selected_pool = select_pool_for_pair(
         rpc_client,
@@ -245,10 +249,11 @@ pub async fn provision_raydium_cp_swap_pool(
         requested_config = ?args.amm_config,
         selected_config = %selected_pool.config.address,
         selected_config_index = selected_pool.config.index,
+        selected_config_trade_fee_rate = selected_pool.config.trade_fee_rate,
         selected_pool = %selected_pool.addresses.pool,
         create_pool_fee_lamports = selected_pool.config.create_pool_fee,
         existing_pool = selected_pool.existing_snapshot.is_some(),
-        "selected raydium 0.25% pool provisioning target",
+        "selected raydium cp-swap pool provisioning target",
     );
 
     let mut remaining_tvl_usdc = args.total_tvl_usdc;
@@ -604,7 +609,7 @@ fn decode_amm_config(address: Address, account: &Account) -> Result<Option<AmmCo
     )
     .map_err(|err| io::Error::other(format!("failed to decode amm config {}: {err}", address)))?;
 
-    if raw.discriminator != AMM_CONFIG_DISCRIMINATOR || raw.trade_fee_rate != 2_500 {
+    if raw.discriminator != AMM_CONFIG_DISCRIMINATOR {
         return Ok(None);
     }
     if raw.disable_create_pool != 0 {
@@ -614,6 +619,7 @@ fn decode_amm_config(address: Address, account: &Account) -> Result<Option<AmmCo
     Ok(Some(AmmConfigInfo {
         address,
         index: raw.index,
+        trade_fee_rate: raw.trade_fee_rate,
         create_pool_fee: raw.create_pool_fee,
     }))
 }
@@ -660,7 +666,7 @@ async fn select_pool_for_pair(
 
     first_missing.ok_or_else(|| {
         io::Error::other(format!(
-            "no suitable 0.25% raydium cp-swap config/pool found for pair {} / {}",
+            "no suitable raydium cp-swap config/pool found for pair {} / {}",
             token_0.mint, token_1.mint
         ))
         .into()
