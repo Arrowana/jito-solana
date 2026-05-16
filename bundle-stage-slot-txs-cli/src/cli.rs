@@ -58,6 +58,20 @@ impl Config {
 
                 Ok(())
             }
+            TransactionMode::ManifestPlaceCancel(args) => {
+                self.require_identity()?;
+                self.require_keypair()?;
+                let expected_market_count = usize::from(self.consecutive_slots);
+                if args.markets.len() != expected_market_count {
+                    return Err(io::Error::other(format!(
+                        "manifest-place-cancel requires exactly {} --market values for consecutive_slots={}, got {}",
+                        expected_market_count,
+                        self.consecutive_slots,
+                        args.markets.len(),
+                    )));
+                }
+                args.validate()
+            }
             TransactionMode::ScanRaydiumCpSwap(args) => {
                 if args.simulate_top > 0 {
                     self.require_keypair().map(|_| ())?;
@@ -68,18 +82,22 @@ impl Config {
                 self.require_keypair()?;
                 args.validate()
             }
+            TransactionMode::CreateManifestSolUsdcMarket => {
+                self.require_keypair()?;
+                Ok(())
+            }
         }
     }
 
     pub fn require_identity(&self) -> Result<Address, io::Error> {
         self.identity.ok_or_else(|| {
-            io::Error::other("--identity is required for memo and raydium-cp-swap modes")
+            io::Error::other("--identity is required for writable transaction modes")
         })
     }
 
     pub fn require_keypair(&self) -> Result<&str, io::Error> {
         self.keypair.as_deref().ok_or_else(|| {
-            io::Error::other("--keypair is required for memo and raydium-cp-swap modes")
+            io::Error::other("--keypair is required for writable transaction modes")
         })
     }
 
@@ -94,8 +112,10 @@ impl Config {
 pub enum TransactionMode {
     Memo,
     RaydiumCpSwap(RaydiumCpSwapArgs),
+    ManifestPlaceCancel(ManifestPlaceCancelArgs),
     ScanRaydiumCpSwap(ScanRaydiumCpSwapArgs),
     ProvisionRaydiumCpSwapPool(ProvisionRaydiumCpSwapPoolArgs),
+    CreateManifestSolUsdcMarket,
 }
 
 impl TransactionMode {
@@ -103,8 +123,10 @@ impl TransactionMode {
         match self {
             TransactionMode::Memo => "memo",
             TransactionMode::RaydiumCpSwap(_) => "raydium-cp-swap",
+            TransactionMode::ManifestPlaceCancel(_) => "manifest-place-cancel",
             TransactionMode::ScanRaydiumCpSwap(_) => "scan-raydium-cp-swap",
             TransactionMode::ProvisionRaydiumCpSwapPool(_) => "provision-raydium-cp-swap-pool",
+            TransactionMode::CreateManifestSolUsdcMarket => "create-manifest-sol-usdc-market",
         }
     }
 }
@@ -138,6 +160,32 @@ pub struct RaydiumCpSwapArgs {
 
     #[arg(long)]
     pub input_amount: u64,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ManifestPlaceCancelArgs {
+    #[arg(long = "market", required = true, num_args = 1..=4)]
+    pub markets: Vec<Address>,
+
+    #[arg(long)]
+    pub base_amount: u64,
+
+    #[arg(long = "price-quote-per-base")]
+    pub ui_price_quote_per_base: f64,
+}
+
+impl ManifestPlaceCancelArgs {
+    fn validate(&self) -> Result<(), io::Error> {
+        if self.base_amount == 0 {
+            return Err(io::Error::other("--base-amount must be greater than 0"));
+        }
+        if !self.ui_price_quote_per_base.is_finite() || self.ui_price_quote_per_base <= 0.0 {
+            return Err(io::Error::other(
+                "--price-quote-per-base must be a finite positive UI quote per base number",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Args, Clone, Debug)]

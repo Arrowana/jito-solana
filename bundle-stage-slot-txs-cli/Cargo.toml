@@ -20,12 +20,12 @@ solana-clock = "=3.0.0"
 solana-commitment-config = "=3.0.0"
 solana-hash = "=3.1.0"
 solana-instruction = "=3.0.0"
-solana-keypair = "=3.0.1"
+solana-keypair = "=3.1.2"
 solana-pubkey = { version = "=3.0.0", default-features = false }
 solana-rent = "=3.0.0"
 solana-rpc-client = { path = "../rpc-client", default-features = false }
 solana-rpc-client-api = { path = "../rpc-client-api" }
-solana-signature = { version = "=3.1.0", default-features = false }
+solana-signature = { version = "=3.3.0", default-features = false }
 solana-signer = "=3.0.0"
 solana-system-interface = "=2.0.0"
 solana-transaction = "=3.0.2"
@@ -36,3 +36,7 @@ spl-token-interface = "=2.0.0"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+litesvm = "0.10.0"
+solana-program-pack = "=3.0.0"
