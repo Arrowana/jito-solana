@@ -1,6 +1,8 @@
 mod cli;
 mod error;
 mod logging;
+mod manifest;
+mod manifest_market;
 mod provision;
 mod raydium_cp_swap_constants;
 mod scan;
@@ -16,6 +18,7 @@ use {
     dotenvy::from_path_override,
     error::BoxError,
     logging::init_logging,
+    manifest_market::create_manifest_sol_usdc_market,
     provision::provision_raydium_cp_swap_pool,
     scan::scan_raydium_cp_swap_pools,
     schedule::{
@@ -104,6 +107,21 @@ async fn main() -> Result<(), BoxError> {
         );
         provision_raydium_cp_swap_pool(rpc_client.as_ref(), &signer, args, jup_api_key.as_deref())
             .await?;
+        return Ok(());
+    }
+    if let cli::TransactionMode::CreateManifestSolUsdcMarket = &transaction_mode {
+        let keypair_path = config.require_keypair()?;
+        let signer = read_keypair_file(keypair_path).map_err(|err| {
+            io::Error::other(format!(
+                "failed to read keypair from {}: {err}",
+                keypair_path,
+            ))
+        })?;
+        info!(
+            rpc_url = %config.rpc_url,
+            "starting manifest SOL/USDC market creation",
+        );
+        create_manifest_sol_usdc_market(rpc_client.as_ref(), &signer).await?;
         return Ok(());
     }
 
