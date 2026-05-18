@@ -8,8 +8,6 @@ pub const MANIFEST_PROGRAM_ID: Address = address!("MNFSTqtC93rEfYHB6hF82sKdZpUDF
 pub const MANIFEST_WRAPPER_PROGRAM_ID: Address =
     address!("wMNFSTkir3HgyZTsB7uqu3i7FA73grFCptPXgrZjksL");
 pub const SYSTEM_PROGRAM_ID: Address = address!("11111111111111111111111111111111");
-pub const WSOL_MINT: Address = address!("So11111111111111111111111111111111111111112");
-pub const USDC_MINT: Address = address!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 pub const MARKET_FIXED_DISCRIMINANT: u64 = 4_859_840_929_024_028_656;
 
 #[repr(C, packed)]

@@ -62,12 +62,12 @@ impl Config {
                 self.require_identity()?;
                 self.require_keypair()?;
                 let expected_market_count = usize::from(self.consecutive_slots);
-                if args.markets.len() != expected_market_count {
+                if args.common().markets.len() != expected_market_count {
                     return Err(io::Error::other(format!(
                         "manifest-place-cancel requires exactly {} --market values for consecutive_slots={}, got {}",
                         expected_market_count,
                         self.consecutive_slots,
-                        args.markets.len(),
+                        args.common().markets.len(),
                     )));
                 }
                 args.validate()
@@ -82,9 +82,9 @@ impl Config {
                 self.require_keypair()?;
                 args.validate()
             }
-            TransactionMode::CreateManifestSolUsdcMarket => {
+            TransactionMode::CreateManifestMarket(args) => {
                 self.require_keypair()?;
-                Ok(())
+                args.validate()
             }
         }
     }
@@ -115,7 +115,8 @@ pub enum TransactionMode {
     ManifestPlaceCancel(ManifestPlaceCancelArgs),
     ScanRaydiumCpSwap(ScanRaydiumCpSwapArgs),
     ProvisionRaydiumCpSwapPool(ProvisionRaydiumCpSwapPoolArgs),
-    CreateManifestSolUsdcMarket,
+    #[command(name = "create-manifest-market", alias = "create-manifest-sol-usdc-market")]
+    CreateManifestMarket(CreateManifestMarketArgs),
 }
 
 impl TransactionMode {
@@ -126,7 +127,7 @@ impl TransactionMode {
             TransactionMode::ManifestPlaceCancel(_) => "manifest-place-cancel",
             TransactionMode::ScanRaydiumCpSwap(_) => "scan-raydium-cp-swap",
             TransactionMode::ProvisionRaydiumCpSwapPool(_) => "provision-raydium-cp-swap-pool",
-            TransactionMode::CreateManifestSolUsdcMarket => "create-manifest-sol-usdc-market",
+            TransactionMode::CreateManifestMarket(_) => "create-manifest-market",
         }
     }
 }
@@ -164,24 +165,92 @@ pub struct RaydiumCpSwapArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct ManifestPlaceCancelArgs {
+    #[command(subcommand)]
+    pub order: ManifestPlaceCancelOrder,
+}
+
+impl ManifestPlaceCancelArgs {
+    pub fn common(&self) -> &ManifestPlaceCancelCommonArgs {
+        match &self.order {
+            ManifestPlaceCancelOrder::Ask(args) => &args.common,
+            ManifestPlaceCancelOrder::Bid(args) => &args.common,
+        }
+    }
+
+    fn validate(&self) -> Result<(), io::Error> {
+        self.common().validate()
+    }
+}
+
+#[derive(Subcommand, Clone, Debug)]
+pub enum ManifestPlaceCancelOrder {
+    Ask(ManifestPlaceCancelAskArgs),
+    Bid(ManifestPlaceCancelBidArgs),
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ManifestPlaceCancelCommonArgs {
     #[arg(long = "market", required = true, num_args = 1..=4)]
     pub markets: Vec<Address>,
 
     #[arg(long)]
-    pub base_amount: u64,
+    pub base_mint: Address,
+
+    #[arg(long)]
+    pub quote_mint: Address,
 
     #[arg(long = "price-quote-per-base")]
     pub ui_price_quote_per_base: f64,
 }
 
-impl ManifestPlaceCancelArgs {
+impl ManifestPlaceCancelCommonArgs {
     fn validate(&self) -> Result<(), io::Error> {
-        if self.base_amount == 0 {
-            return Err(io::Error::other("--base-amount must be greater than 0"));
+        if self.base_mint == self.quote_mint {
+            return Err(io::Error::other(
+                "--base-mint and --quote-mint must differ",
+            ));
         }
         if !self.ui_price_quote_per_base.is_finite() || self.ui_price_quote_per_base <= 0.0 {
             return Err(io::Error::other(
                 "--price-quote-per-base must be a finite positive UI quote per base number",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ManifestPlaceCancelAskArgs {
+    #[command(flatten)]
+    pub common: ManifestPlaceCancelCommonArgs,
+
+    #[arg(long)]
+    pub base_amount: u64,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ManifestPlaceCancelBidArgs {
+    #[command(flatten)]
+    pub common: ManifestPlaceCancelCommonArgs,
+
+    #[arg(long)]
+    pub quote_amount: u64,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct CreateManifestMarketArgs {
+    #[arg(long)]
+    pub base_mint: Address,
+
+    #[arg(long)]
+    pub quote_mint: Address,
+}
+
+impl CreateManifestMarketArgs {
+    fn validate(&self) -> Result<(), io::Error> {
+        if self.base_mint == self.quote_mint {
+            return Err(io::Error::other(
+                "--base-mint and --quote-mint must differ",
             ));
         }
         Ok(())

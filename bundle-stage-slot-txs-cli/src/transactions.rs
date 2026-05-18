@@ -4,7 +4,7 @@ mod raydium_cp_swap;
 
 use {
     crate::{
-        cli::{ManifestPlaceCancelArgs, RaydiumCpSwapArgs, TransactionMode},
+        cli::{ManifestPlaceCancelArgs, ManifestPlaceCancelOrder, RaydiumCpSwapArgs, TransactionMode},
         error::BoxError,
     },
     solana_address::Address,
@@ -49,8 +49,16 @@ pub(crate) struct ResolvedRaydiumCpSwapArgs {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResolvedManifestPlaceCancelArgs {
     pub market: Address,
-    pub base_amount: u64,
+    pub base_mint: Address,
+    pub quote_mint: Address,
+    pub order: ResolvedManifestPlaceCancelOrder,
     pub ui_price_quote_per_base: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ResolvedManifestPlaceCancelOrder {
+    Ask { base_amount: u64 },
+    Bid { quote_amount: u64 },
 }
 
 pub(crate) fn resolve_transaction_modes(
@@ -67,7 +75,7 @@ pub(crate) fn resolve_transaction_modes(
         }
         TransactionMode::ScanRaydiumCpSwap(_)
         | TransactionMode::ProvisionRaydiumCpSwapPool(_)
-        | TransactionMode::CreateManifestSolUsdcMarket => Err(io::Error::other(
+        | TransactionMode::CreateManifestMarket(_) => Err(io::Error::other(
             "selected subcommand is not a slot-monitor transaction mode",
         )
         .into()),
@@ -107,17 +115,27 @@ fn resolve_manifest_transaction_modes(
     args: &ManifestPlaceCancelArgs,
     slot_count: usize,
 ) -> Result<Vec<ResolvedTransactionMode>, BoxError> {
-    if args.markets.len() < slot_count {
+    let common = args.common();
+    if common.markets.len() < slot_count {
         return Err(io::Error::other(format!(
             "need at least {} configured markets for slot_count={}, got {}",
             slot_count,
             slot_count,
-            args.markets.len(),
+            common.markets.len(),
         ))
         .into());
     }
 
-    Ok(args
+    let order = match &args.order {
+        ManifestPlaceCancelOrder::Ask(ask_args) => ResolvedManifestPlaceCancelOrder::Ask {
+            base_amount: ask_args.base_amount,
+        },
+        ManifestPlaceCancelOrder::Bid(bid_args) => ResolvedManifestPlaceCancelOrder::Bid {
+            quote_amount: bid_args.quote_amount,
+        },
+    };
+
+    Ok(common
         .markets
         .iter()
         .take(slot_count)
@@ -125,8 +143,10 @@ fn resolve_manifest_transaction_modes(
         .map(|market| {
             ResolvedTransactionMode::ManifestPlaceCancel(ResolvedManifestPlaceCancelArgs {
                 market,
-                base_amount: args.base_amount,
-                ui_price_quote_per_base: args.ui_price_quote_per_base,
+                base_mint: common.base_mint,
+                quote_mint: common.quote_mint,
+                order,
+                ui_price_quote_per_base: common.ui_price_quote_per_base,
             })
         })
         .collect())

@@ -1,10 +1,7 @@
 use {
     crate::{
         error::BoxError,
-        manifest::{
-            build_create_market_instruction, MarketFixedRaw, MANIFEST_PROGRAM_ID, USDC_MINT,
-            WSOL_MINT,
-        },
+        manifest::{build_create_market_instruction, MarketFixedRaw, MANIFEST_PROGRAM_ID},
     },
     solana_address::Address,
     solana_keypair::Keypair,
@@ -16,9 +13,11 @@ use {
     tracing::info,
 };
 
-pub async fn create_manifest_sol_usdc_market(
+pub async fn create_manifest_market(
     rpc_client: &RpcClient,
     payer: &Keypair,
+    base_mint: Address,
+    quote_mint: Address,
 ) -> Result<Address, BoxError> {
     let market = Keypair::new();
     let market_address = market.pubkey();
@@ -34,7 +33,7 @@ pub async fn create_manifest_sol_usdc_market(
             size_of::<MarketFixedRaw>() as u64,
             &MANIFEST_PROGRAM_ID,
         ),
-        build_create_market_instruction(payer.pubkey(), market_address, WSOL_MINT, USDC_MINT),
+        build_create_market_instruction(payer.pubkey(), market_address, base_mint, quote_mint),
     ];
     let transaction = VersionedTransaction::from(Transaction::new_signed_with_payer(
         &instructions,
@@ -47,9 +46,9 @@ pub async fn create_manifest_sol_usdc_market(
     info!(
         market = %market_address,
         signature = %signature,
-        base_mint = %WSOL_MINT,
-        quote_mint = %USDC_MINT,
-        "created manifest SOL/USDC market",
+        base_mint = %base_mint,
+        quote_mint = %quote_mint,
+        "created manifest market",
     );
     println!("{market_address}");
     Ok(market_address)
