@@ -3,10 +3,10 @@ use {
         error::BoxError,
         manifest::{
             MarketFixedRaw, MANIFEST_PROGRAM_ID, MANIFEST_WRAPPER_PROGRAM_ID,
-            MARKET_FIXED_DISCRIMINANT, SYSTEM_PROGRAM_ID, USDC_MINT, WSOL_MINT,
+            MARKET_FIXED_DISCRIMINANT, SYSTEM_PROGRAM_ID,
         },
         slot_assert::build_assert_slot_instruction,
-        transactions::ResolvedManifestPlaceCancelArgs,
+        transactions::{ResolvedManifestPlaceCancelArgs, ResolvedManifestPlaceCancelOrder},
     },
     bytemuck::{Pod, Zeroable},
     solana_address::Address,
@@ -27,7 +27,7 @@ use {
         address::get_associated_token_address_with_program_id,
         instruction::create_associated_token_account_idempotent,
     },
-    std::{cmp::Ordering, io, mem::size_of},
+    std::{cmp::Ordering, collections::HashSet, io, mem::size_of},
     tracing::info,
 };
 
@@ -35,6 +35,9 @@ const WRAPPER_STATE_DISCRIMINANT: u64 = 1;
 const WRAPPER_FIXED_SIZE: usize = 64;
 const WRAPPER_BLOCK_HEADER_SIZE: usize = 16;
 const WRAPPER_MARKET_INFO_SIZE: usize = 80;
+const MARKET_BLOCK_HEADER_SIZE: usize = 16;
+const RESTING_ORDER_SIZE: usize = 64;
+const ORDER_TYPE_GLOBAL: u8 = 3;
 const NIL: u32 = u32::MAX;
 
 #[repr(C, packed)]
@@ -78,16 +81,36 @@ struct MarketInfo {
     base_mint_decimals: u8,
     quote_mint_decimals: u8,
     base_vault: Address,
+    quote_vault: Address,
     base_token_program: Address,
+    quote_token_program: Address,
+    best_bid: Option<ManifestOrderSummary>,
+    best_ask: Option<ManifestOrderSummary>,
+    global_bid_count: usize,
+    global_ask_count: usize,
+    highest_global_bid: Option<ManifestOrderSummary>,
+    lowest_global_ask: Option<ManifestOrderSummary>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ManifestOrderSummary {
+    price_inner: u128,
+    base_atoms: u64,
+    order_type: u8,
 }
 
 pub(crate) struct PreparedManifestPlaceCancel {
     market_info: MarketInfo,
     wrapper_state: Address,
-    user_base_token_account: Address,
-    base_amount: u64,
+    user_token_account: Address,
+    order: ResolvedManifestPlaceCancelOrder,
+    deposit_amount: u64,
+    order_base_amount: u64,
     price_mantissa: u32,
     price_exponent: i8,
+    deposit_mint: Address,
+    deposit_vault: Address,
+    deposit_token_program: Address,
 }
 
 pub(super) async fn prepare_transactions(
@@ -96,19 +119,23 @@ pub(super) async fn prepare_transactions(
     args: &ResolvedManifestPlaceCancelArgs,
 ) -> Result<PreparedManifestPlaceCancel, BoxError> {
     let market_info = load_market_info(rpc_client, args.market).await?;
-    validate_wsol_usdc_market(&market_info)?;
+    validate_expected_market(&market_info, args.base_mint, args.quote_mint)?;
     let (price_mantissa, price_exponent) = price_to_mantissa_and_exponent(
         args.ui_price_quote_per_base,
         market_info.base_mint_decimals,
         market_info.quote_mint_decimals,
     )?;
+    let ask_price_inner = price_inner_from_mantissa_and_exponent(price_mantissa, price_exponent);
+    validate_order_does_not_cross(&market_info, args.order, ask_price_inner)?;
     let wrapper_state = find_wrapper_state(rpc_client, signer.pubkey(), &[args.market])
         .await?
         .ok_or_else(|| io::Error::other("manifest wrapper state missing after startup setup"))?;
-    let user_base_token_account = get_associated_token_address_with_program_id(
+    let (deposit_amount, order_base_amount, deposit_mint, deposit_vault, deposit_token_program) =
+        order_amounts_and_deposit_accounts(&market_info, args.order, ask_price_inner)?;
+    let user_token_account = get_associated_token_address_with_program_id(
         &signer.pubkey(),
-        &market_info.base_mint,
-        &market_info.base_token_program,
+        &deposit_mint,
+        &deposit_token_program,
     );
 
     info!(
@@ -116,20 +143,33 @@ pub(super) async fn prepare_transactions(
         wrapper_state = %wrapper_state,
         base_mint = %market_info.base_mint,
         quote_mint = %market_info.quote_mint,
-        base_amount = args.base_amount,
+        order = ?args.order,
+        deposit_amount,
+        order_base_amount,
         ui_price_quote_per_base = args.ui_price_quote_per_base,
         price_mantissa,
         price_exponent,
-        "prepared manifest wrapper wSOL/USDC bad ask place/cancel transactions",
+        best_bid_price_inner = ?market_info.best_bid.map(|order| order.price_inner),
+        best_ask_price_inner = ?market_info.best_ask.map(|order| order.price_inner),
+        global_bid_count = market_info.global_bid_count,
+        global_ask_count = market_info.global_ask_count,
+        highest_global_bid_price_inner = ?market_info.highest_global_bid.map(|order| order.price_inner),
+        lowest_global_ask_price_inner = ?market_info.lowest_global_ask.map(|order| order.price_inner),
+        "prepared manifest wrapper place/cancel transactions",
     );
 
     Ok(PreparedManifestPlaceCancel {
         market_info,
         wrapper_state,
-        user_base_token_account,
-        base_amount: args.base_amount,
+        user_token_account,
+        order: args.order,
+        deposit_amount,
+        order_base_amount,
         price_mantissa,
         price_exponent,
+        deposit_mint,
+        deposit_vault,
+        deposit_token_program,
     })
 }
 
@@ -164,7 +204,7 @@ pub async fn run_startup_setup(
     args: &ResolvedManifestPlaceCancelArgs,
 ) -> Result<(), BoxError> {
     let market_info = load_market_info(rpc_client, args.market).await?;
-    validate_wsol_usdc_market(&market_info)?;
+    validate_expected_market(&market_info, args.base_mint, args.quote_mint)?;
     let mut setup_instructions = Vec::new();
     let mut setup_signers = Vec::new();
     let mut created_wrapper = false;
@@ -193,21 +233,26 @@ pub async fn run_startup_setup(
         }
     };
 
-    let user_base_token_account = get_associated_token_address_with_program_id(
+    let (deposit_mint, deposit_token_program) = match args.order {
+        ResolvedManifestPlaceCancelOrder::Ask { .. } => {
+            (market_info.base_mint, market_info.base_token_program)
+        }
+        ResolvedManifestPlaceCancelOrder::Bid { .. } => {
+            (market_info.quote_mint, market_info.quote_token_program)
+        }
+    };
+    let user_token_account = get_associated_token_address_with_program_id(
         &signer.pubkey(),
-        &market_info.base_mint,
-        &market_info.base_token_program,
+        &deposit_mint,
+        &deposit_token_program,
     );
-    if rpc_client
-        .get_account(&user_base_token_account)
-        .await
-        .is_err()
+    if rpc_client.get_account(&user_token_account).await.is_err()
     {
         setup_instructions.push(create_associated_token_account_idempotent(
             &signer.pubkey(),
             &signer.pubkey(),
-            &market_info.base_mint,
-            &market_info.base_token_program,
+            &deposit_mint,
+            &deposit_token_program,
         ));
     }
 
@@ -277,7 +322,9 @@ pub fn log_post_simulation(
     info!(
         market = %prepared.market_info.market,
         wrapper_state = %prepared.wrapper_state,
-        base_amount = prepared.base_amount,
+        order = ?prepared.order,
+        deposit_amount = prepared.deposit_amount,
+        order_base_amount = prepared.order_base_amount,
         "simulated manifest wrapper place/cancel bundle",
     );
     Ok(())
@@ -365,7 +412,7 @@ fn build_claim_seat_instruction(owner: Address, market: Address, wrapper_state: 
 fn build_wrapper_deposit_instruction(owner: Address, prepared: &PreparedManifestPlaceCancel) -> Instruction {
     let mut data = Vec::with_capacity(9);
     data.push(2);
-    data.extend_from_slice(&prepared.base_amount.to_le_bytes());
+    data.extend_from_slice(&prepared.deposit_amount.to_le_bytes());
 
     Instruction {
         program_id: MANIFEST_WRAPPER_PROGRAM_ID,
@@ -373,11 +420,11 @@ fn build_wrapper_deposit_instruction(owner: Address, prepared: &PreparedManifest
             AccountMeta::new_readonly(MANIFEST_PROGRAM_ID, false),
             AccountMeta::new(owner, true),
             AccountMeta::new(prepared.market_info.market, false),
-            AccountMeta::new(prepared.user_base_token_account, false),
-            AccountMeta::new(prepared.market_info.base_vault, false),
-            AccountMeta::new_readonly(prepared.market_info.base_token_program, false),
+            AccountMeta::new(prepared.user_token_account, false),
+            AccountMeta::new(prepared.deposit_vault, false),
+            AccountMeta::new_readonly(prepared.deposit_token_program, false),
             AccountMeta::new(prepared.wrapper_state, false),
-            AccountMeta::new_readonly(prepared.market_info.base_mint, false),
+            AccountMeta::new_readonly(prepared.deposit_mint, false),
         ],
         data,
     }
@@ -386,7 +433,7 @@ fn build_wrapper_deposit_instruction(owner: Address, prepared: &PreparedManifest
 fn build_wrapper_withdraw_instruction(owner: Address, prepared: &PreparedManifestPlaceCancel) -> Instruction {
     let mut data = Vec::with_capacity(9);
     data.push(3);
-    data.extend_from_slice(&prepared.base_amount.to_le_bytes());
+    data.extend_from_slice(&prepared.deposit_amount.to_le_bytes());
 
     Instruction {
         program_id: MANIFEST_WRAPPER_PROGRAM_ID,
@@ -394,11 +441,11 @@ fn build_wrapper_withdraw_instruction(owner: Address, prepared: &PreparedManifes
             AccountMeta::new_readonly(MANIFEST_PROGRAM_ID, false),
             AccountMeta::new(owner, true),
             AccountMeta::new(prepared.market_info.market, false),
-            AccountMeta::new(prepared.user_base_token_account, false),
-            AccountMeta::new(prepared.market_info.base_vault, false),
-            AccountMeta::new_readonly(prepared.market_info.base_token_program, false),
+            AccountMeta::new(prepared.user_token_account, false),
+            AccountMeta::new(prepared.deposit_vault, false),
+            AccountMeta::new_readonly(prepared.deposit_token_program, false),
             AccountMeta::new(prepared.wrapper_state, false),
-            AccountMeta::new_readonly(prepared.market_info.base_mint, false),
+            AccountMeta::new_readonly(prepared.deposit_mint, false),
         ],
         data,
     }
@@ -415,10 +462,13 @@ fn build_wrapper_place_order_instruction(
     data.push(0);
     data.extend_from_slice(&1_u32.to_le_bytes());
     data.extend_from_slice(&target_slot.to_le_bytes());
-    data.extend_from_slice(&prepared.base_amount.to_le_bytes());
+    data.extend_from_slice(&prepared.order_base_amount.to_le_bytes());
     data.extend_from_slice(&prepared.price_mantissa.to_le_bytes());
     data.push(prepared.price_exponent as u8);
-    data.push(0);
+    data.push(u8::from(matches!(
+        prepared.order,
+        ResolvedManifestPlaceCancelOrder::Bid { .. }
+    )));
     data.extend_from_slice(&0_u32.to_le_bytes());
     data.push(2);
 
@@ -478,16 +528,119 @@ fn slot_uniquifier_memo(target_slot: Slot, transaction_index: usize) -> String {
     format!("slot:{target_slot}:tx:{transaction_index}")
 }
 
-fn validate_wsol_usdc_market(market_info: &MarketInfo) -> Result<(), BoxError> {
-    if market_info.base_mint != WSOL_MINT || market_info.quote_mint != USDC_MINT {
+fn validate_expected_market(
+    market_info: &MarketInfo,
+    expected_base_mint: Address,
+    expected_quote_mint: Address,
+) -> Result<(), BoxError> {
+    if market_info.base_mint != expected_base_mint || market_info.quote_mint != expected_quote_mint {
         return Err(io::Error::other(format!(
-            "manifest-place-cancel expects a wSOL/USDC market with base={} and quote={}, got base={} quote={}",
-            WSOL_MINT, USDC_MINT, market_info.base_mint, market_info.quote_mint,
+            "manifest-place-cancel expects a market with base={} and quote={}, got base={} quote={}",
+            expected_base_mint, expected_quote_mint, market_info.base_mint, market_info.quote_mint,
         ))
         .into());
     }
 
     Ok(())
+}
+
+fn validate_order_does_not_cross(
+    market_info: &MarketInfo,
+    order: ResolvedManifestPlaceCancelOrder,
+    order_price_inner: u128,
+) -> Result<(), BoxError> {
+    match order {
+        ResolvedManifestPlaceCancelOrder::Ask { .. } => {
+            let Some(best_bid) = market_info.best_bid else {
+                return Ok(());
+            };
+
+            if order_price_inner < best_bid.price_inner {
+                let crossing_global_bid = market_info
+                    .highest_global_bid
+                    .filter(|global_bid| order_price_inner < global_bid.price_inner);
+                return Err(io::Error::other(format!(
+                    "manifest-place-cancel ask would cross current best bid for market {}: ask_price_inner={} best_bid_price_inner={} best_bid_base_atoms={} best_bid_order_type={} global_bid_count={} crossing_global_bid_price_inner={}",
+                    market_info.market,
+                    order_price_inner,
+                    best_bid.price_inner,
+                    best_bid.base_atoms,
+                    best_bid.order_type,
+                    market_info.global_bid_count,
+                    crossing_global_bid
+                        .map(|order| order.price_inner.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                ))
+                .into());
+            }
+        }
+        ResolvedManifestPlaceCancelOrder::Bid { .. } => {
+            let Some(best_ask) = market_info.best_ask else {
+                return Ok(());
+            };
+
+            if order_price_inner > best_ask.price_inner {
+                let crossing_global_ask = market_info
+                    .lowest_global_ask
+                    .filter(|global_ask| order_price_inner > global_ask.price_inner);
+                return Err(io::Error::other(format!(
+                    "manifest-place-cancel bid would cross current best ask for market {}: bid_price_inner={} best_ask_price_inner={} best_ask_base_atoms={} best_ask_order_type={} global_ask_count={} crossing_global_ask_price_inner={}",
+                    market_info.market,
+                    order_price_inner,
+                    best_ask.price_inner,
+                    best_ask.base_atoms,
+                    best_ask.order_type,
+                    market_info.global_ask_count,
+                    crossing_global_ask
+                        .map(|order| order.price_inner.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn order_amounts_and_deposit_accounts(
+    market_info: &MarketInfo,
+    order: ResolvedManifestPlaceCancelOrder,
+    price_inner: u128,
+) -> Result<(u64, u64, Address, Address, Address), BoxError> {
+    match order {
+        ResolvedManifestPlaceCancelOrder::Ask { base_amount } => {
+            Ok((
+                base_amount,
+                base_amount,
+                market_info.base_mint,
+                market_info.base_vault,
+                market_info.base_token_program,
+            ))
+        }
+        ResolvedManifestPlaceCancelOrder::Bid { quote_amount } => {
+            let order_base_amount = u128::from(quote_amount)
+                .checked_mul(1_000_000_000_000_000_000)
+                .ok_or_else(|| io::Error::other("manifest bid amount conversion overflow"))?
+                / price_inner;
+            let order_base_amount = u64::try_from(order_base_amount).map_err(|_| {
+                io::Error::other("manifest bid order base amount does not fit in u64")
+            })?;
+            if order_base_amount == 0 {
+                return Err(io::Error::other(
+                    "manifest bid quote amount is too small for the configured price",
+                )
+                .into());
+            }
+            Ok((
+                quote_amount,
+                order_base_amount,
+                market_info.quote_mint,
+                market_info.quote_vault,
+                market_info.quote_token_program,
+            ))
+        }
+    }
 }
 
 fn price_to_mantissa_and_exponent(
@@ -524,6 +677,12 @@ fn price_to_mantissa_and_exponent(
     .into())
 }
 
+fn price_inner_from_mantissa_and_exponent(mantissa: u32, exponent: i8) -> u128 {
+    let scale_exponent = u32::try_from(i16::from(exponent) + 18)
+        .expect("manifest price exponent is in the supported range");
+    u128::from(mantissa) * 10_u128.pow(scale_exponent)
+}
+
 async fn load_market_info(rpc_client: &RpcClient, market: Address) -> Result<MarketInfo, BoxError> {
     let account = rpc_client.get_account(&market).await?;
     if account.owner != MANIFEST_PROGRAM_ID {
@@ -555,6 +714,29 @@ async fn load_market_info(rpc_client: &RpcClient, market: Address) -> Result<Mar
     }
 
     let base_mint_account = rpc_client.get_account(&raw.base_mint).await?;
+    let quote_mint_account = rpc_client.get_account(&raw.quote_mint).await?;
+    let best_bid = read_market_order(&account.data, raw.bids_best_index)?;
+    let best_ask = read_market_order(&account.data, raw.asks_best_index)?;
+    let bid_orders = collect_market_orders(&account.data, raw.bids_root_index)?;
+    let ask_orders = collect_market_orders(&account.data, raw.asks_root_index)?;
+    let global_bid_count = bid_orders
+        .iter()
+        .filter(|order| order.order_type == ORDER_TYPE_GLOBAL)
+        .count();
+    let global_ask_count = ask_orders
+        .iter()
+        .filter(|order| order.order_type == ORDER_TYPE_GLOBAL)
+        .count();
+    let highest_global_bid = bid_orders
+        .iter()
+        .filter(|order| order.order_type == ORDER_TYPE_GLOBAL)
+        .max_by_key(|order| order.price_inner)
+        .copied();
+    let lowest_global_ask = ask_orders
+        .iter()
+        .filter(|order| order.order_type == ORDER_TYPE_GLOBAL)
+        .min_by_key(|order| order.price_inner)
+        .copied();
     Ok(MarketInfo {
         market,
         base_mint: raw.base_mint,
@@ -562,8 +744,72 @@ async fn load_market_info(rpc_client: &RpcClient, market: Address) -> Result<Mar
         base_mint_decimals: raw.base_mint_decimals,
         quote_mint_decimals: raw.quote_mint_decimals,
         base_vault: raw.base_vault,
+        quote_vault: raw.quote_vault,
         base_token_program: base_mint_account.owner,
+        quote_token_program: quote_mint_account.owner,
+        best_bid,
+        best_ask,
+        global_bid_count,
+        global_ask_count,
+        highest_global_bid,
+        lowest_global_ask,
     })
+}
+
+fn collect_market_orders(
+    market_account_data: &[u8],
+    root_index: u32,
+) -> Result<Vec<ManifestOrderSummary>, BoxError> {
+    let mut orders = Vec::new();
+    let mut stack = Vec::new();
+    let mut seen = HashSet::new();
+    if root_index != NIL {
+        stack.push(root_index);
+    }
+
+    while let Some(index) = stack.pop() {
+        if index == NIL || !seen.insert(index) {
+            continue;
+        }
+
+        let node_offset = size_of::<MarketFixedRaw>() + index as usize;
+        let header = market_account_data
+            .get(node_offset..node_offset + MARKET_BLOCK_HEADER_SIZE)
+            .ok_or_else(|| io::Error::other("manifest market order node index out of bounds"))?;
+        let left = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        stack.push(left);
+        stack.push(right);
+
+        if let Some(order) = read_market_order(market_account_data, index)? {
+            orders.push(order);
+        }
+    }
+
+    Ok(orders)
+}
+
+fn read_market_order(
+    market_account_data: &[u8],
+    index: u32,
+) -> Result<Option<ManifestOrderSummary>, BoxError> {
+    if index == NIL {
+        return Ok(None);
+    }
+
+    let order_offset = size_of::<MarketFixedRaw>() + index as usize + MARKET_BLOCK_HEADER_SIZE;
+    let order = market_account_data
+        .get(order_offset..order_offset + RESTING_ORDER_SIZE)
+        .ok_or_else(|| io::Error::other("manifest market resting order index out of bounds"))?;
+    let price_inner = u128::from_le_bytes(order[0..16].try_into().unwrap());
+    let base_atoms = u64::from_le_bytes(order[16..24].try_into().unwrap());
+    let order_type = order[41];
+
+    Ok(Some(ManifestOrderSummary {
+        price_inner,
+        base_atoms,
+        order_type,
+    }))
 }
 
 async fn find_wrapper_state(
@@ -722,13 +968,28 @@ mod tests {
                 base_mint_decimals: 6,
                 quote_mint_decimals: 6,
                 base_vault: market_raw.base_vault,
+                quote_vault: market_raw.quote_vault,
                 base_token_program: spl_token_interface::id(),
+                quote_token_program: spl_token_interface::id(),
+                best_bid: None,
+                best_ask: None,
+                global_bid_count: 0,
+                global_ask_count: 0,
+                highest_global_bid: None,
+                lowest_global_ask: None,
             },
             wrapper_state,
-            user_base_token_account,
-            base_amount: 100_000,
+            user_token_account: user_base_token_account,
+            order: ResolvedManifestPlaceCancelOrder::Ask {
+                base_amount: 100_000,
+            },
+            deposit_amount: 100_000,
+            order_base_amount: 100_000,
             price_mantissa: 1_000_000,
             price_exponent: 6,
+            deposit_mint: base_mint,
+            deposit_vault: market_raw.base_vault,
+            deposit_token_program: spl_token_interface::id(),
         };
 
         let starting_amount = token_amount(&svm, user_base_token_account);

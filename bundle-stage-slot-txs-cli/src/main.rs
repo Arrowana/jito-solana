@@ -18,7 +18,7 @@ use {
     dotenvy::from_path_override,
     error::BoxError,
     logging::init_logging,
-    manifest_market::create_manifest_sol_usdc_market,
+    manifest_market::create_manifest_market,
     provision::provision_raydium_cp_swap_pool,
     scan::scan_raydium_cp_swap_pools,
     schedule::{
@@ -109,7 +109,7 @@ async fn main() -> Result<(), BoxError> {
             .await?;
         return Ok(());
     }
-    if let cli::TransactionMode::CreateManifestSolUsdcMarket = &transaction_mode {
+    if let cli::TransactionMode::CreateManifestMarket(args) = &transaction_mode {
         let keypair_path = config.require_keypair()?;
         let signer = read_keypair_file(keypair_path).map_err(|err| {
             io::Error::other(format!(
@@ -119,9 +119,11 @@ async fn main() -> Result<(), BoxError> {
         })?;
         info!(
             rpc_url = %config.rpc_url,
-            "starting manifest SOL/USDC market creation",
+            base_mint = %args.base_mint,
+            quote_mint = %args.quote_mint,
+            "starting manifest market creation",
         );
-        create_manifest_sol_usdc_market(rpc_client.as_ref(), &signer).await?;
+        create_manifest_market(rpc_client.as_ref(), &signer, args.base_mint, args.quote_mint).await?;
         return Ok(());
     }
 
