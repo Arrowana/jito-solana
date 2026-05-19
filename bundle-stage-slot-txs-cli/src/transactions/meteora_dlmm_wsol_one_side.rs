@@ -22,13 +22,14 @@ use {
         address::get_associated_token_address_with_program_id,
         instruction::create_associated_token_account_idempotent,
     },
-    std::{io, mem::size_of, path::PathBuf},
+    std::{io, mem::size_of},
     tracing::info,
 };
 
 declare_program!(dlmm);
 
 const WSOL_MINT: Address = address!("So11111111111111111111111111111111111111112");
+const RAY_MINT: Address = address!("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R");
 const METEORA_DLMM_PROGRAM_ID: Address = address!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const SYSTEM_PROGRAM_ID: Address = address!("11111111111111111111111111111111");
 const RENT_SYSVAR_ID: Address = address!("SysvarRent111111111111111111111111111111111");
@@ -36,6 +37,8 @@ const MEMO_PROGRAM_ID: Address = address!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDL
 const DLMM_BINS_PER_ARRAY: i32 = 70;
 const BASIS_POINTS: u16 = 10_000;
 const TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
+const DEFAULT_WSOL_USDC_PRICE: f64 = 90.0;
+const DEFAULT_RAY_USDC_PRICE: f64 = 0.631;
 
 pub(crate) struct PreparedMeteoraDlmmAddRemoveWsolLiquidity {
     pair: DlmmPairInfo,
@@ -89,7 +92,7 @@ async fn prepare_transactions_inner(
     };
     let target_implied_wsol_usdc_price =
         pair.implied_wsol_usdc_price_at_bin(rpc_client, target_bin_id).await?;
-    let reference_wsol_usdc_price = load_wsol_usdc_price_from_jupiter_verified_csv()?;
+    let reference_wsol_usdc_price = default_token_usdc_price(WSOL_MINT)?;
     let target_wsol_discount_bps =
         (((target_implied_wsol_usdc_price / reference_wsol_usdc_price) - 1.0) * 10_000.0).round()
             as i64;
@@ -491,11 +494,7 @@ async fn token_metadata(rpc_client: &RpcClient, mint: Address) -> Result<TokenMe
         .await
         .map_err(|err| io::Error::other(format!("failed to get token supply for {mint}: {err}")))?
         .decimals;
-    let usd_price = if mint == WSOL_MINT {
-        load_wsol_usdc_price_from_jupiter_verified_csv()?
-    } else {
-        load_token_usdc_price_from_jupiter_verified_csv(mint)?
-    };
+    let usd_price = default_token_usdc_price(mint)?;
     Ok(TokenMetadata { decimals, usd_price })
 }
 
@@ -748,69 +747,15 @@ fn build_uniquifier_memo_instruction(signer: Address, memo: &str) -> Instruction
     )
 }
 
-fn load_wsol_usdc_price_from_jupiter_verified_csv() -> Result<f64, BoxError> {
-    load_token_usdc_price_from_jupiter_verified_csv(WSOL_MINT)
-}
-
-fn load_token_usdc_price_from_jupiter_verified_csv(mint: Address) -> Result<f64, BoxError> {
-    let path = jupiter_verified_tokens_csv_path()?;
-    let mut reader = csv::ReaderBuilder::new().trim(csv::Trim::All).from_path(&path)?;
-    let headers = reader.headers()?.clone();
-    let id_index = headers
-        .iter()
-        .position(|header| header == "id")
-        .ok_or_else(|| io::Error::other(format!("csv {} is missing id column", path.display())))?;
-    let usd_price_index = headers
-        .iter()
-        .position(|header| header == "usdPrice")
-        .ok_or_else(|| io::Error::other(format!("csv {} is missing usdPrice column", path.display())))?;
-    for record in reader.records() {
-        let record = record?;
-        if record.get(id_index) == Some(&mint.to_string()) {
-            let price = record
-                .get(usd_price_index)
-                .ok_or_else(|| io::Error::other("missing usdPrice"))?
-                .parse::<f64>()?;
-            if price.is_finite() && price > 0.0 {
-                return Ok(price);
-            }
-        }
+fn default_token_usdc_price(mint: Address) -> Result<f64, BoxError> {
+    match mint {
+        WSOL_MINT => Ok(DEFAULT_WSOL_USDC_PRICE),
+        RAY_MINT => Ok(DEFAULT_RAY_USDC_PRICE),
+        _ => Err(io::Error::other(format!(
+            "missing hardcoded default USDC price for mint {mint}"
+        ))
+        .into()),
     }
-    Err(io::Error::other(format!("missing Jupiter CSV price for mint {mint}")).into())
-}
-
-fn jupiter_verified_tokens_csv_path() -> Result<PathBuf, BoxError> {
-    let current_dir = std::env::current_dir()?;
-    let candidates = [
-        current_dir.join("jupiter_verified_tokens.csv"),
-        current_dir
-            .parent()
-            .map(|parent| parent.join("jupiter_verified_tokens.csv"))
-            .unwrap_or_else(|| current_dir.join("jupiter_verified_tokens.csv")),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("jupiter_verified_tokens.csv"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .map(|parent| parent.join("jupiter_verified_tokens.csv"))
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("jupiter_verified_tokens.csv")
-            }),
-    ];
-
-    candidates
-        .iter()
-        .find(|path| path.exists())
-        .cloned()
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "missing jupiter_verified_tokens.csv; looked in: {}",
-                candidates
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ))
-            .into()
-        })
 }
 
 #[cfg(test)]
@@ -820,7 +765,7 @@ mod tests {
         litesvm::LiteSVM,
         solana_rpc_client::nonblocking::rpc_client::RpcClient,
         solana_system_interface::instruction::transfer as system_transfer,
-        std::env,
+        std::{env, path::PathBuf},
     };
 
     const RAY_WSOL_PAIR: Address = address!("6jjGocGMvwtzXkUT1aA8S7XuyaGcaR17ZKiL1eqBJ9on");
