@@ -20,7 +20,7 @@ use {
     logging::init_logging,
     manifest_market::create_manifest_market,
     provision::provision_raydium_cp_swap_pool,
-    scan::scan_raydium_cp_swap_pools,
+    scan::{scan_meteora_dlmm_pools, scan_raydium_cp_swap_pools},
     schedule::{
         countdown_log_bucket, current_slot, estimated_time_to_target, format_eta,
         published_state_for_target, published_state_is_within_grace_window,
@@ -81,6 +81,20 @@ async fn main() -> Result<(), BoxError> {
             "starting raydium cp-swap pool scan",
         );
         scan_raydium_cp_swap_pools(rpc_client.as_ref(), args, signer.as_ref()).await?;
+        return Ok(());
+    }
+    if let cli::TransactionMode::ScanMeteoraDlmm(args) = &transaction_mode {
+        info!(
+            rpc_url = %config.rpc_url,
+            token_allowlist_source = args.token_allowlist_source.label(),
+            min_token_volume_24h_usd = args.min_token_volume_24h_usd,
+            min_wsol_discount_bps = args.min_wsol_discount_bps,
+            min_estimated_tvl_usdc = args.min_estimated_tvl_usdc,
+            top = args.top,
+            output_csv = %args.output_csv.display(),
+            "starting meteora dlmm pool scan",
+        );
+        scan_meteora_dlmm_pools(rpc_client.as_ref(), args).await?;
         return Ok(());
     }
     if let cli::TransactionMode::ProvisionRaydiumCpSwapPool(args) = &transaction_mode {

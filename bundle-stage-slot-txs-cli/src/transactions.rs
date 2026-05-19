@@ -1,10 +1,14 @@
 mod memo;
 mod manifest_place_cancel;
+mod meteora_dlmm_wsol_one_side;
 mod raydium_cp_swap;
 
 use {
     crate::{
-        cli::{ManifestPlaceCancelArgs, ManifestPlaceCancelOrder, RaydiumCpSwapArgs, TransactionMode},
+        cli::{
+            ManifestPlaceCancelArgs, ManifestPlaceCancelOrder,
+            MeteoraDlmmAddRemoveWsolLiquidityArgs, RaydiumCpSwapArgs, TransactionMode,
+        },
         error::BoxError,
     },
     solana_address::Address,
@@ -22,6 +26,9 @@ use {
 pub(crate) enum PreparedTransactions {
     Memo,
     ManifestPlaceCancel(manifest_place_cancel::PreparedManifestPlaceCancel),
+    MeteoraDlmmAddRemoveWsolLiquidity(
+        meteora_dlmm_wsol_one_side::PreparedMeteoraDlmmAddRemoveWsolLiquidity,
+    ),
     RaydiumCpSwap(raydium_cp_swap::PreparedRaydiumCpSwap),
 }
 
@@ -36,6 +43,7 @@ pub(crate) struct RoundTripSimulationSummary {
 pub(crate) enum ResolvedTransactionMode {
     Memo,
     ManifestPlaceCancel(ResolvedManifestPlaceCancelArgs),
+    MeteoraDlmmAddRemoveWsolLiquidity(ResolvedMeteoraDlmmAddRemoveWsolLiquidityArgs),
     RaydiumCpSwap(ResolvedRaydiumCpSwapArgs),
 }
 
@@ -44,6 +52,13 @@ pub(crate) struct ResolvedRaydiumCpSwapArgs {
     pub pool: Address,
     pub input_mint: Address,
     pub input_amount: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolvedMeteoraDlmmAddRemoveWsolLiquidityArgs {
+    pub pair: Address,
+    pub wsol_amount: u64,
+    pub min_wsol_discount_bps: i64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,16 +85,51 @@ pub(crate) fn resolve_transaction_modes(
             .map(|_| ResolvedTransactionMode::Memo)
             .collect()),
         TransactionMode::RaydiumCpSwap(args) => resolve_raydium_transaction_modes(args, slot_count),
+        TransactionMode::MeteoraDlmmAddRemoveWsolLiquidity(args) => {
+            resolve_meteora_dlmm_transaction_modes(args, slot_count)
+        }
         TransactionMode::ManifestPlaceCancel(args) => {
             resolve_manifest_transaction_modes(args, slot_count)
         }
         TransactionMode::ScanRaydiumCpSwap(_)
+        | TransactionMode::ScanMeteoraDlmm(_)
         | TransactionMode::ProvisionRaydiumCpSwapPool(_)
         | TransactionMode::CreateManifestMarket(_) => Err(io::Error::other(
             "selected subcommand is not a slot-monitor transaction mode",
         )
         .into()),
     }
+}
+
+fn resolve_meteora_dlmm_transaction_modes(
+    args: &MeteoraDlmmAddRemoveWsolLiquidityArgs,
+    slot_count: usize,
+) -> Result<Vec<ResolvedTransactionMode>, BoxError> {
+    if args.pairs.len() < slot_count {
+        return Err(io::Error::other(format!(
+            "need at least {} configured dlmm pairs for slot_count={}, got {}",
+            slot_count,
+            slot_count,
+            args.pairs.len(),
+        ))
+        .into());
+    }
+
+    Ok(args
+        .pairs
+        .iter()
+        .take(slot_count)
+        .copied()
+        .map(|pair| {
+            ResolvedTransactionMode::MeteoraDlmmAddRemoveWsolLiquidity(
+                ResolvedMeteoraDlmmAddRemoveWsolLiquidityArgs {
+                    pair,
+                    wsol_amount: args.wsol_amount,
+                    min_wsol_discount_bps: args.min_wsol_discount_bps,
+                },
+            )
+        })
+        .collect())
 }
 
 fn resolve_raydium_transaction_modes(
@@ -166,6 +216,17 @@ pub(crate) async fn prepare_transactions(
                 manifest_place_cancel::prepare_transactions(rpc_client, signer, args).await?,
             ),
         ),
+        ResolvedTransactionMode::MeteoraDlmmAddRemoveWsolLiquidity(args) => Ok(
+            PreparedTransactions::MeteoraDlmmAddRemoveWsolLiquidity(
+                meteora_dlmm_wsol_one_side::prepare_transactions(
+                    rpc_client,
+                    signer,
+                    args,
+                    target_slot,
+                )
+                .await?,
+            ),
+        ),
         ResolvedTransactionMode::RaydiumCpSwap(args) => Ok(PreparedTransactions::RaydiumCpSwap(
             raydium_cp_swap::prepare_transactions(rpc_client, signer, blockhash, args, target_slot)
                 .await?,
@@ -196,6 +257,15 @@ pub(crate) fn build_transactions(
                 include_slot_assert,
             )
         }
+        PreparedTransactions::MeteoraDlmmAddRemoveWsolLiquidity(prepared) => {
+            meteora_dlmm_wsol_one_side::build_transactions(
+                prepared,
+                signer,
+                blockhash,
+                target_slot,
+                include_slot_assert,
+            )
+        }
         PreparedTransactions::RaydiumCpSwap(prepared) => {
             raydium_cp_swap::build_transactions(
                 prepared,
@@ -219,6 +289,7 @@ pub async fn run_startup_setup(
             ResolvedTransactionMode::ManifestPlaceCancel(args) => {
                 manifest_place_cancel::run_startup_setup(rpc_client, signer, args).await?;
             }
+            ResolvedTransactionMode::MeteoraDlmmAddRemoveWsolLiquidity(_) => {}
             ResolvedTransactionMode::RaydiumCpSwap(args) => {
                 raydium_cp_swap::run_startup_setup(rpc_client, signer, args).await?;
             }
@@ -243,6 +314,9 @@ pub fn simulation_account_configs(
         PreparedTransactions::ManifestPlaceCancel(prepared) => {
             manifest_place_cancel::simulation_account_configs(prepared, transaction_count)
         }
+        PreparedTransactions::MeteoraDlmmAddRemoveWsolLiquidity(_) => {
+            Ok((vec![None; transaction_count], vec![None; transaction_count]))
+        }
         PreparedTransactions::RaydiumCpSwap(prepared) => {
             raydium_cp_swap::simulation_account_configs(prepared, transaction_count)
         }
@@ -258,6 +332,9 @@ pub fn log_post_simulation(
         PreparedTransactions::ManifestPlaceCancel(prepared) => {
             manifest_place_cancel::log_post_simulation(prepared, simulation_result)
         }
+        PreparedTransactions::MeteoraDlmmAddRemoveWsolLiquidity(prepared) => {
+            meteora_dlmm_wsol_one_side::log_post_simulation(prepared, simulation_result)
+        }
         PreparedTransactions::RaydiumCpSwap(prepared) => {
             raydium_cp_swap::log_post_simulation(prepared, simulation_result)
         }
@@ -271,6 +348,7 @@ pub fn round_trip_simulation_summary(
     match prepared_transactions {
         PreparedTransactions::Memo => Ok(None),
         PreparedTransactions::ManifestPlaceCancel(_) => Ok(None),
+        PreparedTransactions::MeteoraDlmmAddRemoveWsolLiquidity(_) => Ok(None),
         PreparedTransactions::RaydiumCpSwap(prepared) => Ok(Some(
             raydium_cp_swap::round_trip_simulation_summary(prepared, simulation_result)?,
         )),

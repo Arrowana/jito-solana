@@ -7,7 +7,7 @@ use {
 #[derive(Clone, Debug, Parser)]
 #[command(name = "bundle-stage-slot-txs-cli")]
 pub struct Config {
-    #[arg(long)]
+    #[arg(long, env = "RPC_URL")]
     pub rpc_url: String,
 
     #[arg(long)]
@@ -58,6 +58,20 @@ impl Config {
 
                 Ok(())
             }
+            TransactionMode::MeteoraDlmmAddRemoveWsolLiquidity(args) => {
+                self.require_identity()?;
+                self.require_keypair()?;
+                let expected_pair_count = usize::from(self.consecutive_slots);
+                if args.pairs.len() != expected_pair_count {
+                    return Err(io::Error::other(format!(
+                        "meteora-dlmm-add-remove-wsol-liquidity requires exactly {} --pair values for consecutive_slots={}, got {}",
+                        expected_pair_count,
+                        self.consecutive_slots,
+                        args.pairs.len(),
+                    )));
+                }
+                args.validate()
+            }
             TransactionMode::ManifestPlaceCancel(args) => {
                 self.require_identity()?;
                 self.require_keypair()?;
@@ -78,6 +92,7 @@ impl Config {
                 }
                 Ok(())
             }
+            TransactionMode::ScanMeteoraDlmm(args) => args.validate(),
             TransactionMode::ProvisionRaydiumCpSwapPool(args) => {
                 self.require_keypair()?;
                 args.validate()
@@ -112,8 +127,10 @@ impl Config {
 pub enum TransactionMode {
     Memo,
     RaydiumCpSwap(RaydiumCpSwapArgs),
+    MeteoraDlmmAddRemoveWsolLiquidity(MeteoraDlmmAddRemoveWsolLiquidityArgs),
     ManifestPlaceCancel(ManifestPlaceCancelArgs),
     ScanRaydiumCpSwap(ScanRaydiumCpSwapArgs),
+    ScanMeteoraDlmm(ScanMeteoraDlmmArgs),
     ProvisionRaydiumCpSwapPool(ProvisionRaydiumCpSwapPoolArgs),
     #[command(name = "create-manifest-market", alias = "create-manifest-sol-usdc-market")]
     CreateManifestMarket(CreateManifestMarketArgs),
@@ -124,8 +141,12 @@ impl TransactionMode {
         match self {
             TransactionMode::Memo => "memo",
             TransactionMode::RaydiumCpSwap(_) => "raydium-cp-swap",
+            TransactionMode::MeteoraDlmmAddRemoveWsolLiquidity(_) => {
+                "meteora-dlmm-add-remove-wsol-liquidity"
+            }
             TransactionMode::ManifestPlaceCancel(_) => "manifest-place-cancel",
             TransactionMode::ScanRaydiumCpSwap(_) => "scan-raydium-cp-swap",
+            TransactionMode::ScanMeteoraDlmm(_) => "scan-meteora-dlmm",
             TransactionMode::ProvisionRaydiumCpSwapPool(_) => "provision-raydium-cp-swap-pool",
             TransactionMode::CreateManifestMarket(_) => "create-manifest-market",
         }
@@ -161,6 +182,32 @@ pub struct RaydiumCpSwapArgs {
 
     #[arg(long)]
     pub input_amount: u64,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct MeteoraDlmmAddRemoveWsolLiquidityArgs {
+    #[arg(long = "pair", required = true, num_args = 1..=4)]
+    pub pairs: Vec<Address>,
+
+    #[arg(long)]
+    pub wsol_amount: u64,
+
+    #[arg(long, default_value_t = 500)]
+    pub min_wsol_discount_bps: i64,
+}
+
+impl MeteoraDlmmAddRemoveWsolLiquidityArgs {
+    fn validate(&self) -> Result<(), io::Error> {
+        if self.wsol_amount == 0 {
+            return Err(io::Error::other("--wsol-amount must be greater than zero"));
+        }
+        if self.min_wsol_discount_bps < 0 {
+            return Err(io::Error::other(
+                "--min-wsol-discount-bps must be non-negative",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -288,6 +335,46 @@ pub struct ScanRaydiumCpSwapArgs {
 
     #[arg(long, default_value = "raydium-cp-swap-shortlist.csv")]
     pub output_csv: PathBuf,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ScanMeteoraDlmmArgs {
+    #[arg(long, value_enum, default_value_t = TokenAllowlistSource::JupiterVerifiedCsv)]
+    pub token_allowlist_source: TokenAllowlistSource,
+
+    #[arg(long, env = "JUPITER_API_KEY")]
+    pub jupiter_api_key: Option<String>,
+
+    #[arg(long, default_value_t = 100_000.0)]
+    pub min_token_volume_24h_usd: f64,
+
+    #[arg(long, default_value_t = 500)]
+    pub min_wsol_discount_bps: i64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub min_estimated_tvl_usdc: f64,
+
+    #[arg(long, default_value_t = 50)]
+    pub top: usize,
+
+    #[arg(long, default_value = "meteora-dlmm-shortlist.csv")]
+    pub output_csv: PathBuf,
+}
+
+impl ScanMeteoraDlmmArgs {
+    fn validate(&self) -> Result<(), io::Error> {
+        if !(self.min_token_volume_24h_usd.is_finite() && self.min_token_volume_24h_usd >= 0.0) {
+            return Err(io::Error::other(
+                "--min-token-volume-24h-usd must be a finite non-negative number",
+            ));
+        }
+        if !(self.min_estimated_tvl_usdc.is_finite() && self.min_estimated_tvl_usdc >= 0.0) {
+            return Err(io::Error::other(
+                "--min-estimated-tvl-usdc must be a finite non-negative number",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Args, Clone, Debug)]
