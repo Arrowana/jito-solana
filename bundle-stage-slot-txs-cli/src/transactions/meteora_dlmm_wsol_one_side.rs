@@ -43,13 +43,11 @@ pub(crate) struct PreparedMeteoraDlmmAddRemoveWsolLiquidity {
     base: Address,
     target_bin_id: i32,
     target_bin_array: Address,
-    target_bin_array_index: i64,
     wsol_amount: u64,
     target_implied_wsol_usdc_price: f64,
     reference_wsol_usdc_price: f64,
     target_wsol_discount_bps: i64,
     initialize_position: bool,
-    initialize_bin_array: bool,
     token_x_program: Address,
     token_y_program: Address,
     user_token_x: Address,
@@ -73,7 +71,7 @@ pub(super) async fn prepare_transactions(
     args: &ResolvedMeteoraDlmmAddRemoveWsolLiquidityArgs,
     _target_slot: Slot,
 ) -> Result<PreparedMeteoraDlmmAddRemoveWsolLiquidity, BoxError> {
-    prepare_transactions_inner(rpc_client, signer, args, true).await
+    prepare_transactions_inner(rpc_client, signer, args, true, true).await
 }
 
 async fn prepare_transactions_inner(
@@ -81,6 +79,7 @@ async fn prepare_transactions_inner(
     signer: &Keypair,
     args: &ResolvedMeteoraDlmmAddRemoveWsolLiquidityArgs,
     require_existing_wsol: bool,
+    initialize_position_in_setup_phase: bool,
 ) -> Result<PreparedMeteoraDlmmAddRemoveWsolLiquidity, BoxError> {
     let pair = DlmmPairInfo::load(rpc_client, args.pair).await?;
     let wsol_side = pair.wsol_side()?;
@@ -109,12 +108,11 @@ async fn prepare_transactions_inner(
     let target_bin_array = derive_bin_array_address(pair.pair, target_bin_id);
     let target_bin_array_index = bin_array_index_for_bin_id(target_bin_id);
     let target_bin_index = bin_index_in_array(target_bin_id);
+    ensure_bin_array_exists(rpc_client, &pair, target_bin_array, target_bin_array_index).await?;
     ensure_target_bin_empty(rpc_client, target_bin_array, target_bin_index).await?;
 
     let base = signer.pubkey();
     let position = derive_position_address(pair.pair, base, target_bin_id, 1);
-    let initialize_position = rpc_client.get_account(&position).await.is_err();
-    let initialize_bin_array = rpc_client.get_account(&target_bin_array).await.is_err();
     let token_x_program = mint_owner(rpc_client, pair.token_x_mint).await?;
     let token_y_program = mint_owner(rpc_client, pair.token_y_mint).await?;
     let user_token_x =
@@ -131,8 +129,13 @@ async fn prepare_transactions_inner(
             "insufficient existing WSOL for DLMM liquidity: user_wsol={}, available={}, required={}",
             user_wsol, existing_wsol_amount, args.wsol_amount
         ))
-        .into());
+            .into());
     }
+    let initialized_position = if initialize_position_in_setup_phase {
+        ensure_position_initialized(rpc_client, signer, &pair, position, target_bin_id).await?
+    } else {
+        false
+    };
 
     info!(
         pair = %pair.pair,
@@ -143,8 +146,8 @@ async fn prepare_transactions_inner(
         target_bin_index,
         wsol_side = ?wsol_side,
         position = %position,
-        initialize_position,
-        initialize_bin_array,
+        initialized_position,
+        target_bin_array_exists = true,
         wsol_amount = args.wsol_amount,
         existing_wsol_amount,
         target_implied_wsol_usdc_price,
@@ -159,13 +162,11 @@ async fn prepare_transactions_inner(
         base,
         target_bin_id,
         target_bin_array,
-        target_bin_array_index,
         wsol_amount: args.wsol_amount,
         target_implied_wsol_usdc_price,
         reference_wsol_usdc_price,
         target_wsol_discount_bps,
-        initialize_position,
-        initialize_bin_array,
+        initialize_position: false,
         token_x_program,
         token_y_program,
         user_token_x,
@@ -298,33 +299,10 @@ fn build_setup_instructions(
         &prepared.pair.token_y_mint,
         &prepared.token_y_program,
     ));
-    if prepared.initialize_bin_array {
-        instructions.push(build_initialize_bin_array_instruction(prepared, signer));
-    }
     if prepared.initialize_position {
         instructions.push(build_initialize_position_pda_instruction(prepared, signer)?);
     }
     Ok(instructions)
-}
-
-fn build_initialize_bin_array_instruction(
-    prepared: &PreparedMeteoraDlmmAddRemoveWsolLiquidity,
-    signer: Address,
-) -> Instruction {
-    let mut data = Vec::with_capacity(16);
-    data.extend_from_slice(dlmm::client::args::InitializeBinArray::DISCRIMINATOR);
-    data.extend_from_slice(&prepared.target_bin_array_index.to_le_bytes());
-
-    Instruction {
-        program_id: METEORA_DLMM_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new_readonly(prepared.pair.pair, false),
-            AccountMeta::new(prepared.target_bin_array, false),
-            AccountMeta::new(signer, true),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data,
-    }
 }
 
 fn build_initialize_position_pda_instruction(
@@ -576,6 +554,91 @@ fn parse_token_account_amount(account: &Account) -> Result<u64, BoxError> {
     )?))
 }
 
+async fn ensure_position_initialized(
+    rpc_client: &RpcClient,
+    signer: &Keypair,
+    pair: &DlmmPairInfo,
+    position: Address,
+    target_bin_id: i32,
+) -> Result<bool, BoxError> {
+    if rpc_client.get_account(&position).await.is_ok() {
+        info!(
+            pair = %pair.pair,
+            position = %position,
+            target_bin_id,
+            "meteora dlmm position already exists during setup phase",
+        );
+        return Ok(false);
+    }
+
+    let setup_prepared = PreparedMeteoraDlmmAddRemoveWsolLiquidity {
+        pair: *pair,
+        position,
+        base: signer.pubkey(),
+        target_bin_id,
+        target_bin_array: derive_bin_array_address(pair.pair, target_bin_id),
+        wsol_amount: 0,
+        target_implied_wsol_usdc_price: 0.0,
+        reference_wsol_usdc_price: 0.0,
+        target_wsol_discount_bps: 0,
+        initialize_position: true,
+        token_x_program: spl_token_interface::id(),
+        token_y_program: spl_token_interface::id(),
+        user_token_x: signer.pubkey(),
+        user_token_y: signer.pubkey(),
+    };
+    let instruction = build_initialize_position_pda_instruction(&setup_prepared, signer.pubkey())?;
+    let blockhash = rpc_client.get_latest_blockhash().await?;
+    let transaction = build_transaction(signer, blockhash, &[instruction]);
+    let signature = match rpc_client.send_and_confirm_transaction(&transaction).await {
+        Ok(signature) => signature,
+        Err(err) => {
+            if rpc_client.get_account(&position).await.is_ok() {
+                info!(
+                    pair = %pair.pair,
+                    position = %position,
+                    target_bin_id,
+                    err = %err,
+                    "meteora dlmm position pda was initialized by a concurrent setup task",
+                );
+                return Ok(false);
+            }
+            return Err(err.into());
+        }
+    };
+    info!(
+        pair = %pair.pair,
+        position = %position,
+        target_bin_id,
+        signature = %signature,
+        "initialized meteora dlmm position pda during setup phase",
+    );
+    Ok(true)
+}
+
+async fn ensure_bin_array_exists(
+    rpc_client: &RpcClient,
+    pair: &DlmmPairInfo,
+    target_bin_array: Address,
+    target_bin_array_index: i64,
+) -> Result<(), BoxError> {
+    if rpc_client.get_account(&target_bin_array).await.is_ok() {
+        info!(
+            pair = %pair.pair,
+            target_bin_array = %target_bin_array,
+            target_bin_array_index,
+            "meteora dlmm bin array already exists during setup phase",
+        );
+        return Ok(());
+    }
+
+    Err(io::Error::other(format!(
+        "target bin array does not exist; refusing to initialize it to avoid bin-array rent cost: pair={}, target_bin_array={}, target_bin_array_index={}",
+        pair.pair, target_bin_array, target_bin_array_index
+    ))
+    .into())
+}
+
 fn decode_bin_array(
     address: Address,
     account: &Account,
@@ -778,7 +841,7 @@ mod tests {
                 wsol_amount: TEST_WSOL_AMOUNT,
                 min_wsol_discount_bps: 0,
             };
-            let prepared = prepare_transactions_inner(&rpc_client, &signer, &args, false)
+            let prepared = prepare_transactions_inner(&rpc_client, &signer, &args, false, false)
                 .await
                 .unwrap();
 
@@ -793,9 +856,8 @@ mod tests {
             hydrate_account(&mut svm, &rpc_client, prepared.pair.reserve_x).await;
             hydrate_account(&mut svm, &rpc_client, prepared.pair.reserve_y).await;
             create_and_fund_wsol_account(&mut svm, &signer, TEST_WSOL_AMOUNT);
-            if !prepared.initialize_bin_array {
-                hydrate_account(&mut svm, &rpc_client, prepared.target_bin_array).await;
-            }
+            initialize_position_in_litesvm(&mut svm, &signer, &prepared);
+            hydrate_account(&mut svm, &rpc_client, prepared.target_bin_array).await;
 
             let transactions =
                 build_transactions(&prepared, &signer, svm.latest_blockhash(), 42, false).unwrap();
@@ -839,6 +901,21 @@ mod tests {
         ))
         .unwrap();
         user_wsol
+    }
+
+    fn initialize_position_in_litesvm(
+        svm: &mut LiteSVM,
+        signer: &Keypair,
+        prepared: &PreparedMeteoraDlmmAddRemoveWsolLiquidity,
+    ) {
+        let instruction = build_initialize_position_pda_instruction(prepared, signer.pubkey()).unwrap();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&signer.pubkey()),
+            &[signer],
+            svm.latest_blockhash(),
+        ))
+        .unwrap();
     }
 
     async fn hydrate_account(svm: &mut LiteSVM, rpc_client: &RpcClient, address: Address) {
