@@ -74,7 +74,23 @@ pub(super) async fn prepare_transactions(
     args: &ResolvedMeteoraDlmmAddRemoveWsolLiquidityArgs,
     _target_slot: Slot,
 ) -> Result<PreparedMeteoraDlmmAddRemoveWsolLiquidity, BoxError> {
-    prepare_transactions_inner(rpc_client, signer, args, true, true).await
+    prepare_transactions_inner(rpc_client, signer, args, true, false).await
+}
+
+pub(super) async fn run_target_setup(
+    rpc_client: &RpcClient,
+    signer: &Keypair,
+    args: &ResolvedMeteoraDlmmAddRemoveWsolLiquidityArgs,
+) -> Result<(), BoxError> {
+    let pair = DlmmPairInfo::load(rpc_client, args.pair).await?;
+    let target_bin_id = target_bin_id_for_wsol_side(&pair)?;
+    let target_bin_array = derive_bin_array_address(pair.pair, target_bin_id);
+    let target_bin_array_index = bin_array_index_for_bin_id(target_bin_id);
+    ensure_bin_array_exists(rpc_client, &pair, target_bin_array, target_bin_array_index).await?;
+
+    let position = derive_position_address(pair.pair, signer.pubkey(), target_bin_id, 1);
+    ensure_position_initialized(rpc_client, signer, &pair, position, target_bin_id).await?;
+    Ok(())
 }
 
 async fn prepare_transactions_inner(
@@ -86,10 +102,7 @@ async fn prepare_transactions_inner(
 ) -> Result<PreparedMeteoraDlmmAddRemoveWsolLiquidity, BoxError> {
     let pair = DlmmPairInfo::load(rpc_client, args.pair).await?;
     let wsol_side = pair.wsol_side()?;
-    let target_bin_id = match wsol_side {
-        WsolSide::X => pair.active_id + 1,
-        WsolSide::Y => pair.active_id - 1,
-    };
+    let target_bin_id = target_bin_id_for_wsol_side(&pair)?;
     let target_implied_wsol_usdc_price =
         pair.implied_wsol_usdc_price_at_bin(rpc_client, target_bin_id).await?;
     let reference_wsol_usdc_price = default_token_usdc_price(WSOL_MINT)?;
@@ -136,6 +149,9 @@ async fn prepare_transactions_inner(
     }
     let initialized_position = if initialize_position_in_setup_phase {
         ensure_position_initialized(rpc_client, signer, &pair, position, target_bin_id).await?
+    } else if require_existing_wsol {
+        ensure_position_exists(rpc_client, &pair, position, target_bin_id).await?;
+        false
     } else {
         false
     };
@@ -420,6 +436,13 @@ fn compressed_deposit_amount(amount: u64) -> (u32, u64) {
     (compressed_amount, decompress_multiplier)
 }
 
+fn target_bin_id_for_wsol_side(pair: &DlmmPairInfo) -> Result<i32, BoxError> {
+    Ok(match pair.wsol_side()? {
+        WsolSide::X => pair.active_id + 1,
+        WsolSide::Y => pair.active_id - 1,
+    })
+}
+
 impl DlmmPairInfo {
     async fn load(rpc_client: &RpcClient, pair: Address) -> Result<Self, BoxError> {
         let account = rpc_client.get_account(&pair).await?;
@@ -613,6 +636,23 @@ async fn ensure_position_initialized(
         "initialized meteora dlmm position pda during setup phase",
     );
     Ok(true)
+}
+
+async fn ensure_position_exists(
+    rpc_client: &RpcClient,
+    pair: &DlmmPairInfo,
+    position: Address,
+    target_bin_id: i32,
+) -> Result<(), BoxError> {
+    if rpc_client.get_account(&position).await.is_ok() {
+        return Ok(());
+    }
+
+    Err(io::Error::other(format!(
+        "meteora dlmm position pda is missing during arming; setup should have run earlier: pair={}, position={}, target_bin_id={}",
+        pair.pair, position, target_bin_id
+    ))
+    .into())
 }
 
 async fn ensure_bin_array_exists(
