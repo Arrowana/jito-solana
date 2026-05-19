@@ -40,7 +40,7 @@ use {
     tracing::{error, info},
     transactions::{
         build_transactions, log_post_simulation, prepare_transactions, resolve_transaction_modes,
-        run_startup_setup, simulation_account_configs, ResolvedTransactionMode,
+        run_startup_setup, run_target_setup, simulation_account_configs, ResolvedTransactionMode,
     },
 };
 
@@ -153,6 +153,7 @@ async fn main() -> Result<(), BoxError> {
     })?);
     let mut published_state = PublishedState::Cleared;
     let mut previous_target_slots = None;
+    let mut previous_setup_target_slots = None;
     let mut previous_countdown_bucket = None;
     let mut leader_schedule_cache = LeaderScheduleCache::default();
 
@@ -221,7 +222,41 @@ async fn main() -> Result<(), BoxError> {
             previous_target_slots = Some(target_slots.clone());
             previous_countdown_bucket =
                 countdown_log_bucket(target_slots.start_slot(), current_slot);
-        } else {
+        }
+
+        if previous_setup_target_slots.as_ref() != Some(&target_slots) {
+            let slot_transaction_modes = configured_transaction_modes
+                .iter()
+                .take(target_slots.slots.len())
+                .cloned()
+                .collect::<Vec<_>>();
+            match run_target_setup(rpc_client.as_ref(), signer.as_ref(), &slot_transaction_modes).await
+            {
+                Ok(()) => {
+                    info!(
+                        current_slot,
+                        target_start_slot = target_slots.start_slot(),
+                        target_last_slot = target_slots.last_slot(),
+                        target_slot_count = target_slots.slots.len(),
+                        "completed target slot range setup",
+                    );
+                    previous_setup_target_slots = Some(target_slots.clone());
+                }
+                Err(err) => {
+                    error!(
+                        current_slot,
+                        target_start_slot = target_slots.start_slot(),
+                        target_last_slot = target_slots.last_slot(),
+                        err = %err,
+                        "failed target slot range setup",
+                    );
+                    sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            }
+        }
+
+        if previous_target_slots.as_ref() == Some(&target_slots) {
             let countdown_bucket = countdown_log_bucket(target_slots.start_slot(), current_slot);
             if previous_countdown_bucket != countdown_bucket {
                 let remaining_slots =

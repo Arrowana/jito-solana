@@ -299,6 +299,25 @@ pub async fn run_startup_setup(
     Ok(())
 }
 
+pub async fn run_target_setup(
+    rpc_client: &RpcClient,
+    signer: &Keypair,
+    transaction_modes: &[ResolvedTransactionMode],
+) -> Result<(), BoxError> {
+    for transaction_mode in transaction_modes {
+        match transaction_mode {
+            ResolvedTransactionMode::MeteoraDlmmAddRemoveWsolLiquidity(args) => {
+                meteora_dlmm_wsol_one_side::run_target_setup(rpc_client, signer, args).await?;
+            }
+            ResolvedTransactionMode::Memo
+            | ResolvedTransactionMode::ManifestPlaceCancel(_)
+            | ResolvedTransactionMode::RaydiumCpSwap(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
 pub fn simulation_account_configs(
     prepared_transactions: &PreparedTransactions,
     transaction_count: usize,
