@@ -22,14 +22,24 @@ use {
         address::get_associated_token_address_with_program_id,
         instruction::create_associated_token_account_idempotent,
     },
-    std::{io, mem::size_of},
+    std::{collections::HashMap, io, mem::size_of, sync::LazyLock},
     tracing::info,
 };
 
 declare_program!(dlmm);
 
 const WSOL_MINT: Address = address!("So11111111111111111111111111111111111111112");
+const USDC_MINT: Address = address!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+const USDT_MINT: Address = address!("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
 const RAY_MINT: Address = address!("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R");
+const JUP_MINT: Address = address!("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN");
+const JTO_MINT: Address = address!("jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL");
+const PYTH_MINT: Address = address!("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3");
+const ME_MINT: Address = address!("MEFNBXixkEbait3xn9bkm8WsJzXtVsaJEn4c8Sam21u");
+const W_MINT: Address = address!("85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ");
+const DRIFT_MINT: Address = address!("DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7");
+const CLOUD_MINT: Address = address!("CLoUDKc4Ane7HeQcPpE3YHnznRxhMimJ4MyaUqyHFzAu");
+const PENGU_MINT: Address = address!("2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv");
 const METEORA_DLMM_PROGRAM_ID: Address = address!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const SYSTEM_PROGRAM_ID: Address = address!("11111111111111111111111111111111");
 const RENT_SYSVAR_ID: Address = address!("SysvarRent111111111111111111111111111111111");
@@ -37,8 +47,22 @@ const MEMO_PROGRAM_ID: Address = address!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDL
 const DLMM_BINS_PER_ARRAY: i32 = 70;
 const BASIS_POINTS: u16 = 10_000;
 const TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
-const DEFAULT_WSOL_USDC_PRICE: f64 = 90.0;
-const DEFAULT_RAY_USDC_PRICE: f64 = 0.631;
+static DEFAULT_TOKEN_USDC_PRICES: LazyLock<HashMap<Address, f64>> = LazyLock::new(|| {
+    HashMap::from([
+        (WSOL_MINT, 90.0),
+        (USDC_MINT, 1.0),
+        (USDT_MINT, 1.0),
+        (RAY_MINT, 0.632),
+        (JUP_MINT, 0.164),
+        (JTO_MINT, 0.297),
+        (PYTH_MINT, 0.047),
+        (ME_MINT, 0.116),
+        (W_MINT, 0.0173),
+        (DRIFT_MINT, 0.085),
+        (CLOUD_MINT, 0.038),
+        (PENGU_MINT, 0.0075),
+    ])
+});
 
 pub(crate) struct PreparedMeteoraDlmmAddRemoveWsolLiquidity {
     pair: DlmmPairInfo,
@@ -788,14 +812,12 @@ fn build_uniquifier_memo_instruction(signer: Address, memo: &str) -> Instruction
 }
 
 fn default_token_usdc_price(mint: Address) -> Result<f64, BoxError> {
-    match mint {
-        WSOL_MINT => Ok(DEFAULT_WSOL_USDC_PRICE),
-        RAY_MINT => Ok(DEFAULT_RAY_USDC_PRICE),
-        _ => Err(io::Error::other(format!(
+    DEFAULT_TOKEN_USDC_PRICES.get(&mint).copied().ok_or_else(|| {
+        io::Error::other(format!(
             "missing hardcoded default USDC price for mint {mint}"
         ))
-        .into()),
-    }
+        .into()
+    })
 }
 
 #[cfg(test)]
