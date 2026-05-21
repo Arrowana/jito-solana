@@ -1,6 +1,8 @@
 use {
     crate::{
-        cli::{ScanMeteoraDlmmArgs, ScanRaydiumCpSwapArgs, TokenAllowlistSource},
+        cli::{
+            DlmmTargetBinMode, ScanMeteoraDlmmArgs, ScanRaydiumCpSwapArgs, TokenAllowlistSource,
+        },
         error::BoxError,
         raydium_cp_swap_constants::{
             AMM_CONFIG_DISCRIMINATOR, POOL_STATE_DISCRIMINATOR, RAYDIUM_CP_SWAP_PROGRAM_ID,
@@ -514,6 +516,7 @@ pub async fn scan_meteora_dlmm_pools(
                 &active_bin_array_accounts,
                 &token_metadata,
                 wsol_metadata.usd_price,
+                &args.target_bin_mode,
             )
             .transpose()
         })
@@ -523,7 +526,7 @@ pub async fn scan_meteora_dlmm_pools(
     ranked_candidates.retain(|candidate| {
         candidate.wsol_discount_bps <= -args.min_wsol_discount_bps
             && candidate.estimated_tvl_usdc >= args.min_estimated_tvl_usdc
-            && candidate.target_bin_is_empty
+            && target_bin_matches_mode(candidate, &args.target_bin_mode)
             && candidate.wsol_is_cheap_for_arbers
     });
     info!(
@@ -985,6 +988,7 @@ fn rank_dlmm_pair_candidate(
     active_bin_array_accounts: &HashMap<Address, Account>,
     token_metadata: &HashMap<Address, TokenMetadata>,
     wsol_usdc_price: f64,
+    target_bin_mode: &DlmmTargetBinMode,
 ) -> Result<Option<RankedDlmmPairCandidate>, BoxError> {
     let non_wsol_metadata = token_metadata
         .get(&candidate.non_wsol_mint)
@@ -1017,7 +1021,10 @@ fn rank_dlmm_pair_candidate(
     if wsol_reserve_amount == 0 {
         return Ok(None);
     }
-    let target_bin_id = target_bin_id_for_wsol_deposit(&candidate);
+    let target_bin_id = match target_bin_mode {
+        DlmmTargetBinMode::Empty => target_bin_id_for_wsol_deposit(&candidate),
+        DlmmTargetBinMode::OppositeTokenOnly => candidate.active_id,
+    };
     let Some(target_bin_info) =
         decode_target_bin_info(candidate.pair, target_bin_id, active_bin_array_accounts)?
     else {
@@ -1145,6 +1152,24 @@ fn decode_target_bin_info(
         total_processing_order_amount: bin.total_processing_order_amount,
         processed_order_remaining_amount: bin.processed_order_remaining_amount,
     }))
+}
+
+fn target_bin_matches_mode(
+    candidate: &RankedDlmmPairCandidate,
+    mode: &DlmmTargetBinMode,
+) -> bool {
+    match mode {
+        DlmmTargetBinMode::Empty => candidate.target_bin_is_empty,
+        DlmmTargetBinMode::OppositeTokenOnly => {
+            candidate.target_bin_liquidity_supply > 0
+                && candidate.target_bin_open_order_amount == 0
+                && match candidate.wsol_side {
+                    "x" => candidate.target_bin_amount_x == 0 && candidate.target_bin_amount_y > 0,
+                    "y" => candidate.target_bin_amount_y == 0 && candidate.target_bin_amount_x > 0,
+                    _ => false,
+                }
+        }
+    }
 }
 
 fn target_bin_array_address(pair: Address, target_bin_id: i32) -> Address {

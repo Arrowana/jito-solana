@@ -172,6 +172,12 @@ impl TokenAllowlistSource {
     }
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+pub enum DlmmTargetBinMode {
+    Empty,
+    OppositeTokenOnly,
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct RaydiumCpSwapArgs {
     #[arg(long = "pool", required = true, num_args = 1..=4)]
@@ -353,6 +359,9 @@ pub struct ScanMeteoraDlmmArgs {
 
     #[arg(long, default_value_t = 0.0)]
     pub min_estimated_tvl_usdc: f64,
+
+    #[arg(long, value_enum, default_value_t = DlmmTargetBinMode::Empty)]
+    pub target_bin_mode: DlmmTargetBinMode,
 
     #[arg(long, default_value_t = 50)]
     pub top: usize,
