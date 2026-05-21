@@ -817,9 +817,8 @@ async fn find_wrapper_state(
     trader: Address,
     markets: &[Address],
 ) -> Result<Option<Address>, BoxError> {
-    #[allow(deprecated)]
     let accounts = rpc_client
-        .get_program_accounts_with_config(
+        .get_program_ui_accounts_with_config(
             &MANIFEST_WRAPPER_PROGRAM_ID,
             RpcProgramAccountsConfig {
                 filters: Some(vec![
@@ -840,6 +839,9 @@ async fn find_wrapper_state(
 
     let mut fallback = None;
     for (wrapper_state, account) in accounts {
+        let account = account.to_account().ok_or_else(|| {
+            io::Error::other(format!("failed to decode wrapper state account {wrapper_state}"))
+        })?;
         if fallback.is_none() {
             fallback = Some(wrapper_state);
         }

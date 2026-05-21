@@ -592,7 +592,7 @@ async fn fetch_amm_configs(rpc_client: &RpcClient) -> Result<Vec<AmmConfigInfo>,
         .into_iter()
         .filter_map(|(address, account)| {
             account
-                .decode()
+                .to_account()
                 .and_then(|account| decode_amm_config(address, &account).transpose())
         })
         .collect::<Result<Vec<_>, _>>()?;

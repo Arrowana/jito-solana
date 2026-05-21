@@ -599,9 +599,8 @@ async fn fetch_dlmm_pair_accounts_with_wsol_side(
             discriminator = ?dlmm::accounts::LbPair::DISCRIMINATOR,
             "fetching meteora dlmm pairs for wsol side",
         );
-        #[allow(deprecated)]
         let side_pair_accounts = rpc_client
-            .get_program_accounts_with_config(
+            .get_program_ui_accounts_with_config(
                 &METEORA_DLMM_PROGRAM_ID,
                 RpcProgramAccountsConfig {
                     filters: Some(vec![
@@ -628,6 +627,9 @@ async fn fetch_dlmm_pair_accounts_with_wsol_side(
             "fetched meteora dlmm pairs for wsol side",
         );
         for (pair, account) in side_pair_accounts {
+            let account = account.to_account().ok_or_else(|| {
+                io::Error::other(format!("failed to decode meteora dlmm pair account {pair}"))
+            })?;
             pairs_by_address.entry(pair).or_insert(account);
         }
     }
@@ -650,9 +652,8 @@ async fn fetch_pool_accounts_with_wsol_side(
             wsol_mint = %WSOL_MINT,
             "fetching raydium cp-swap pools for wsol side",
         );
-        #[allow(deprecated)]
         let side_pool_accounts = rpc_client
-            .get_program_accounts_with_config(
+            .get_program_ui_accounts_with_config(
                 &RAYDIUM_CP_SWAP_PROGRAM_ID,
                 RpcProgramAccountsConfig {
                     filters: Some(vec![
@@ -679,6 +680,9 @@ async fn fetch_pool_accounts_with_wsol_side(
             "fetched raydium cp-swap pools for wsol side",
         );
         for (pool, account) in side_pool_accounts {
+            let account = account.to_account().ok_or_else(|| {
+                io::Error::other(format!("failed to decode raydium cp-swap pool account {pool}"))
+            })?;
             pools_by_address.entry(pool).or_insert(account);
         }
     }
